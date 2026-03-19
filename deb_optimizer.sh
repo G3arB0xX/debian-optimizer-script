@@ -13,7 +13,8 @@ NC='\033[0m' # No Color
 
 info() { echo -e "${GREEN}[INFO] $1${NC}"; }
 warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
-die() { echo -e "${RED}[ERROR] $1${NC}"; exit 1; }
+err()  { echo -e "${RED}[ERROR] $1${NC}"; }
+die()  { echo -e "${RED}[FATAL] $1${NC}"; exit 1; } # 致命错误，退出脚本
 
 # 暂停函数，等待用户按任意键继续
 pause() {
@@ -149,7 +150,7 @@ download_with_fallback() {
         done
         
         if [[ "$success" == "false" ]]; then
-            die "所有国内备用镜像节点均已失效，下载彻底失败，请检查服务器网络。"
+            err "所有国内备用镜像节点均已失效，下载彻底失败，请检查服务器网络。"
         fi
         
     else
@@ -157,7 +158,7 @@ download_with_fallback() {
         info "尝试优先官方直连下载: $original_url"
         if ! curl $curl_opts -o "$target_file" "$original_url"; then
             rm -f "$target_file"
-            die "海外节点直连下载失败，请检查目标链接是否有效: $original_url"
+            err "海外节点直连下载失败，请检查目标链接是否有效: $original_url"
         fi
         info "下载成功: $target_file"
     fi
@@ -472,7 +473,7 @@ EOF
 
 install_xray() {
     info "开始安装/更新 Xray Core..."
-    download_with_fallback "/tmp/xray-install.sh" "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+    download_with_fallback "/tmp/xray-install.sh" "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"|| return 1
     bash /tmp/xray-install.sh install
     if systemctl is-active --quiet xray; then
         info "Xray 安装成功并已运行！"
@@ -485,7 +486,7 @@ uninstall_xray() {
     
     # 1. 执行官方卸载逻辑
     if [[ ! -f "/tmp/xray-install.sh" ]]; then
-        download_with_fallback "/tmp/xray-install.sh" "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+        download_with_fallback "/tmp/xray-install.sh" "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"|| return 1
     fi
     bash /tmp/xray-install.sh remove >/dev/null 2>&1
 
@@ -521,7 +522,7 @@ install_easytier() {
     fi
 
     # 下载官方安装脚本
-    download_with_fallback "/tmp/easytier-install.sh" "https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh"
+    download_with_fallback "/tmp/easytier-install.sh" "https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh"|| return 1
     
     # 智能判断网络环境，决定是否使用代理参数
     local proxy_args=""
@@ -539,10 +540,10 @@ install_easytier() {
     # 加上 || die 的短路拦截，如果官方脚本中途报错退出，外层脚本立刻阻断并爆红提示
     if [[ -d "/opt/easytier" ]] || command -v easytier-core >/dev/null 2>&1; then
         info "检测到 Easytier 已安装，执行 update 更新操作..."
-        bash /tmp/easytier-install.sh update $proxy_args || die "Easytier 更新失败，请检查上方报错日志！"
+        bash /tmp/easytier-install.sh update $proxy_args || { error "Easytier 更新失败，请检查上方报错日志！"; return 1; }
     else
         info "检测到 Easytier 未安装，执行全新安装..."
-        bash /tmp/easytier-install.sh install $proxy_args || die "Easytier 安装失败，请检查上方报错日志！"
+        bash /tmp/easytier-install.sh install $proxy_args || { err "Easytier 安装失败，请检查上方报错日志！"; return 1; }
     fi
     
     # 配置防火墙端口
@@ -555,7 +556,7 @@ uninstall_easytier() {
     info "准备卸载 Easytier..."
     
     if [[ ! -f "/tmp/easytier-install.sh" ]]; then
-        download_with_fallback "/tmp/easytier-install.sh" "https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh"
+        download_with_fallback "/tmp/easytier-install.sh" "https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh"|| return 1
     fi
     bash /tmp/easytier-install.sh uninstall >/dev/null 2>&1
 
@@ -579,11 +580,57 @@ uninstall_easytier() {
 }
 
 install_tailscale() {
-    info "开始安装/更新 Tailscale..."
-    curl -fsSL https://tailscale.com/install.sh | sh
-    ufw allow 41641/udp comment 'Tailscale'
-    info "Tailscale 安装成功，UFW 已放行 41641/udp！"
-    info "请使用 'tailscale up' 命令将其关联到你的账户。"
+    local is_update="false"
+
+    # 1. 智能状态侦测
+    if command -v tailscale >/dev/null 2>&1; then
+        is_update="true"
+        info "检测到 Tailscale 已安装，准备拉取最新版本进行更新..."
+    else
+        info "开始全新安装 Tailscale 客户端..."
+    fi
+
+    # 2. 安全获取官方安装脚本 (带有超时控制)
+    info "正在获取官方安装脚本..."
+    curl -fsSL --connect-timeout 10 https://tailscale.com/install.sh -o /tmp/tailscale-install.sh || { 
+        err "获取安装脚本失败！请检查服务器是否能正常访问 tailscale.com。"
+        return 1 
+    }
+
+    # 3. 执行安装/更新，并严密捕获报错
+    info "正在执行自动部署流程 (调用系统包管理器拉取核心组件，请耐心等待)..."
+    
+    # 屏蔽冗长杂乱的正常输出，但一旦返回非 0 状态码，立刻拦截并警告
+    sh /tmp/tailscale-install.sh >/dev/null 2>&1 || { 
+        err "Tailscale 安装/更新失败！"
+        warn "这通常是因为国内网络拉取官方 APT 源 (pkg.tailscale.com) 超时或 GPG 阻断导致。"
+        warn "建议开启全局代理后重试，或稍后网络畅通时再次执行。"
+        return 1 
+    }
+
+    # 4. 防火墙放行 (加入静默容错逻辑，防止未安装 UFW 时报错)
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 41641/udp comment 'Tailscale P2P' >/dev/null 2>&1
+    fi
+
+    # 5. 差异化结果反馈与引导
+    if [[ "$is_update" == "false" ]]; then
+        info "Tailscale 全新部署成功！"
+        info "已尝试在防火墙放行 41641/udp 端口 (这对于优化 P2P 直连打洞极其重要)。"
+        
+        # 使用醒目的提示框引导用户手动绑定
+        echo -e "\n${YELLOW}================================================================${NC}"
+        echo -e "${GREEN}节点尚未绑定！请退出面板后，在终端手动输入以下命令获取登录链接：${NC}"
+        echo -e "${YELLOW}tailscale up${NC}"
+        echo -e "${YELLOW}================================================================${NC}\n"
+    else
+        info "Tailscale 更新成功！底层守护进程已自动接管。"
+        
+        # 更新完毕后顺手做个健康检查
+        if ! systemctl is-active --quiet tailscaled; then
+            warn "检测到 tailscaled 守护进程似乎未运行，请稍后手动检查: systemctl status tailscaled"
+        fi
+    fi
 }
 uninstall_tailscale() {
     info "准备卸载 Tailscale..."
@@ -607,19 +654,57 @@ uninstall_tailscale() {
 }
 
 install_warp() {
-    info "安装 Cloudflare WARP 客户端并配置 Socks5 模式..."
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list
-    
-    apt-get update -yq && apt-get install -yq cloudflare-warp
+    local is_update="false"
 
-    info "注册并配置 WARP (监听端口: 40000)..."
-    warp-cli --accept-tos registration new
-    warp-cli --accept-tos mode proxy
-    warp-cli --accept-tos proxy port 40000
-    warp-cli --accept-tos connect
+    # 1. 智能状态侦测
+    if command -v warp-cli >/dev/null 2>&1; then
+        is_update="true"
+        info "检测到 Cloudflare WARP 已安装，准备拉取最新包进行更新..."
+    else
+        info "开始安装 Cloudflare WARP 客户端并配置 Socks5 模式..."
+    fi
+
+    # 2. 依赖检查与源配置
+    info "配置 Cloudflare 官方 APT 源..."
+    if ! command -v lsb_release >/dev/null 2>&1 || ! command -v gpg >/dev/null 2>&1; then
+        apt-get update -yq >/dev/null 2>&1
+        apt-get install -yq lsb-release gnupg || { err "系统依赖 (lsb-release/gnupg) 安装失败，请检查网络！"; return 1; }
+    fi
+
+    # 捕获 GPG 下载报错 (国内直连 pkg.cloudflareclient.com 可能受阻)
+    curl -fsSL --connect-timeout 5 https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || { err "GPG 密钥下载失败，请检查网络是否能直连 Cloudflare 源！"; return 1; }
     
-    info "WARP 配置完成！本地 Socks5 代理位于: 127.0.0.1:40000"
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+
+    # 3. 安装或更新
+    info "正在拉取包信息并执行安装/更新 (可能需要一些时间)..."
+    apt-get update -yq >/dev/null 2>&1 || { err "APT 源更新失败，请检查系统源配置！"; return 1; }
+    apt-get install -yq cloudflare-warp || { err "WARP 客户端安装/更新失败！"; return 1; }
+
+    # 4. 差异化配置与容错处理
+    if [[ "$is_update" == "false" ]]; then
+        info "首次安装，正在注册并配置 WARP (监听端口: 40000)..."
+        
+        # 国内机器注册极大可能失败，这里进行重点捕获
+        warp-cli --accept-tos registration new >/dev/null 2>&1 || { 
+            err "WARP 注册失败！"
+            warn "这通常是因为 Cloudflare API 在国内被阻断。请考虑开启全局代理后再试，或放弃安装 WARP。"
+            return 1 
+        }
+        
+        warp-cli --accept-tos mode proxy >/dev/null 2>&1 || { err "WARP 设置代理模式失败！"; return 1; }
+        warp-cli --accept-tos proxy port 40000 >/dev/null 2>&1 || { err "WARP 设置代理端口失败！"; return 1; }
+        warp-cli --accept-tos connect >/dev/null 2>&1 || { err "WARP 启动连接失败！"; return 1; }
+        
+        info "WARP 全新配置完成！本地 Socks5 代理位于: 127.0.0.1:40000"
+    else
+        info "WARP 更新包安装完成！正在验证守护进程状态..."
+        
+        # 更新时无需重新注册设备和改端口，只需要确保连接被重新拉起
+        warp-cli --accept-tos connect >/dev/null 2>&1 || warn "WARP 重新拉起连接失败！请随后手动使用 'warp-cli status' 检查状态。"
+        
+        info "WARP 更新成功！Socks5 代理依然位于: 127.0.0.1:40000"
+    fi
 }
 uninstall_warp() {
     info "准备卸载 Cloudflare WARP 客户端..."
@@ -645,7 +730,7 @@ install_docker() {
     info "开始安装/更新 Docker Engine 与 Docker Compose..."
     
     # 1. 下载官方一键安装脚本
-    download_with_fallback "/tmp/get-docker.sh" "https://raw.githubusercontent.com/docker/docker-install/master/install.sh"
+    download_with_fallback "/tmp/get-docker.sh" "https://raw.githubusercontent.com/docker/docker-install/master/install.sh"|| return 1
     
     # 2. 智能判断网络，执行安装
     if [[ "$IS_CN_REGION" == "true" ]]; then
@@ -701,7 +786,8 @@ EOF
         docker compose version
         warn "注意：Docker 运行容器通常需要开启 IP 转发，请确保你在主菜单开启了该选项。"
     else
-        die "Docker 安装失败，请检查网络或系统环境。"
+        err "Docker 安装失败，请检查网络或系统环境。"
+        return 1
     fi
 }
 uninstall_docker() {
@@ -771,7 +857,8 @@ install_go() {
     info "下载并安装 $GO_LATEST_VERSION (显示下载进度)..."
     # 废弃静默的 wget，改用 curl 并显示进度条，加入严苛超时控制
     if ! curl -# -L --connect-timeout 5 -o /tmp/go.tar.gz "https://${go_domain}/dl/${GO_LATEST_VERSION}.linux-amd64.tar.gz"; then
-        die "Go 语言环境下载失败，请检查网络！"
+        err "Go 语言环境下载失败，请检查网络！"
+        return 1
     fi
     
     rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz
@@ -830,7 +917,8 @@ install_caddy() {
 
     # 确保 Go 环境已就绪
     if ! command -v go >/dev/null 2>&1; then
-        die "未检测到 Go 环境！请先在当前菜单选择【1. 安装 Go 环境】。"
+        err "未检测到 Go 环境！请先在当前菜单选择【1. 修复/更新 Go 环境】。"
+        return 1
     fi
     
     # 确保国内编译环境不卡死
@@ -848,7 +936,10 @@ install_caddy() {
         --with github.com/caddy-dns/cloudflare \
         --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
         
-    if [[ ! -f "./caddy" ]]; then die "Caddy 编译失败，可能是内存不足或网络中断。"; fi
+    if [[ ! -f "./caddy" ]]; then 
+        err "Caddy 编译失败，可能是内存不足或网络中断。"
+        return 1
+    fi
 
     info "编译成功，开始规范化部署..."
     # 仅在编译成功后才停机替换，将业务中断时间降至最低
@@ -973,12 +1064,13 @@ install_derper() {
             was_running="true"
         fi
     else
-        info "开始自编译安装 Tailscale DERPer (添加隐身补丁)..."
+        info "开始自编译安装 Tailscale DERPer (添加隐身防拨测补丁)..."
     fi
 
     # 1. 确保 Go 环境已就绪
     if ! command -v go >/dev/null 2>&1; then
-        die "未检测到 Go 环境！请先在当前菜单选择【1. 安装 Go 环境】。"
+        err "未检测到 Go 环境！请先在当前菜单选择【1. 安装 Go 环境】。"
+        return 1
     fi
     [[ "$IS_CN_REGION" == "true" ]] && export GOPROXY=https://goproxy.cn,direct
 
@@ -999,7 +1091,8 @@ install_derper() {
     
     # 加入拉取失败的拦截与提示
     if ! git clone -b $TS_VERSION --depth 1 "$repo_url"; then
-        die "源码拉取失败！国内镜像源可能存在短暂波动，请稍后重试。"
+        err "源码拉取失败！国内镜像源可能存在短暂波动，请稍后重试。"
+        return 1
     fi
     cd tailscale/cmd/derper
 
@@ -1040,7 +1133,8 @@ func closeConn(w http.ResponseWriter) {\
     # 如果未来官方大改了源码导致 sed 替换失败，这里会立刻拦截，防止编译出裸奔节点
     #if ! grep -q "closeConn(w)" derper.go || ! grep -q "if false {" cert.go; then
     if ! grep -q "closeConn(w)" derper.go; then
-        die "源码魔改失败！你当前指定的 Tailscale 版本 ($TS_VERSION) 源码结构已改变，隐身补丁无法打入。请降级版本或手动查阅源码更新 sed 命令。"
+        err "源码魔改失败！你当前指定的 Tailscale 版本 ($TS_VERSION) 源码结构已改变，隐身补丁无法打入。请降级版本或手动查阅源码更新 sed 命令。"
+        return 1
     fi
     info "代码魔改校验通过！隐身补丁已成功注入。"
     
@@ -1049,7 +1143,8 @@ func closeConn(w http.ResponseWriter) {\
     go build -o /tmp/derper_new
     
     if [[ ! -f "/tmp/derper_new" ]]; then
-        die "DERPer 编译失败！请检查系统环境或源码状态。"
+        err "DERPer 编译失败！请检查系统环境或源码状态。"
+        return 1
     fi
 
     info "编译成功，开始规范化部署..."
@@ -1301,7 +1396,7 @@ show_main_menu() {
         fi
 
         echo -e "=============================================="
-        echo -e "      Debian 全能调优与服务部署管理面板"
+        echo -e "      Debian 系统调优与服务部署管理脚本"
         echo -e "      网络环境: ${net_status_text}"
         echo -e "=============================================="
         echo " 1. 一键系统基础优化 (可重复执行)"

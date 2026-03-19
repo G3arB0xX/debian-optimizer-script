@@ -29,6 +29,9 @@ if [[ -f "$INIT_FLAG" ]]; then
     source "$INIT_FLAG"
 fi
 
+# 全局注入 Go 环境变量，确保检测函数能找到 go 和 xcaddy
+export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
+
 if [[ $EUID -ne 0 ]]; then
    die "此脚本必须以 root 权限运行，请使用 sudo -i 切换后重试。"
 fi
@@ -44,7 +47,7 @@ global_netcheck() {
 
     # 确保系统有 curl 命令用于网络请求
     if ! command -v curl >/dev/null 2>&1; then
-        info "未检测到 curl，正在准备基础依赖..."
+        info "未检测到 curl，准备基础依赖..."
         apt-get update -yq >/dev/null 2>&1
         apt-get install -yq curl >/dev/null 2>&1
     fi
@@ -140,7 +143,7 @@ download_with_fallback() {
                 info "下载成功: $target_file"
                 break
             else
-                warn "该节点响应超时或解析失败，正在无缝切换下一个..."
+                warn "该节点响应超时或解析失败，切换下一个节点..."
                 rm -f "$target_file" # 清理可能残留的损坏文件
             fi
         done
@@ -367,7 +370,7 @@ EOF
         info "Swap 文件已存在但未挂载，尝试重新挂载..."
         mkswap /swapfile && swapon /swapfile
     else
-        info "正在创建 Swap 文件 (${SWAP_SIZE_MB}MB)..."
+        info "创建 Swap 文件 (${SWAP_SIZE_MB}MB)..."
         fallocate -l ${SWAP_SIZE_MB}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=${SWAP_SIZE_MB} status=progress
         chmod 600 /swapfile
         mkswap /swapfile
@@ -430,7 +433,7 @@ get_ip_forward_status() {
 toggle_ip_forwarding() {
     local status=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
     if [[ "$status" == "1" ]]; then
-        info "正在关闭 IP 转发 (切换为纯建站模式)..."
+        info "关闭 IP 转发 (切换为纯建站模式)..."
         rm -f /etc/sysctl.d/99-ip-forwarding.conf
         sysctl -w net.ipv4.ip_forward=0 >/dev/null
         sysctl -w net.ipv4.conf.all.forwarding=0 >/dev/null
@@ -440,7 +443,7 @@ toggle_ip_forwarding() {
         sysctl -w net.ipv4.conf.all.route_localnet=0 >/dev/null
         info "IP 转发已关闭。"
     else
-        info "正在开启 IP 转发 (代理/组网/容器模式就绪)..."
+        info "开启 IP 转发 (代理/组网/容器模式就绪)..."
         cat > /etc/sysctl.d/99-ip-forwarding.conf << EOF
 # ==========================================
 # 代理/组网/容器 专用路由转发配置 (自动生成)
@@ -487,7 +490,7 @@ uninstall_xray() {
     bash /tmp/xray-install.sh remove >/dev/null 2>&1
 
     # 2. 停止服务并清理 Systemd 守护进程
-    info "正在执行深度清理..."
+    info "执行深度清理..."
     systemctl stop xray >/dev/null 2>&1
     systemctl disable xray >/dev/null 2>&1
     rm -rf /etc/systemd/system/xray*
@@ -503,7 +506,7 @@ uninstall_xray() {
     if command -v xray >/dev/null 2>&1; then
         warn "Xray 环境变量可能仍有残留，请手动检查: $(which xray 2>/dev/null)"
     else
-        info "Xray 已彻底清理完毕。"
+        info "Xray 已卸载完毕。"
     fi
 }
 
@@ -512,7 +515,7 @@ install_easytier() {
     
     # 安装前置依赖检查：静默补齐 unzip
     if ! command -v unzip >/dev/null 2>&1; then
-        info "未检测到解压工具 unzip，正在自动补全依赖..."
+        info "未检测到解压工具 unzip，自动补全依赖..."
         apt-get update -yq >/dev/null 2>&1
         apt-get install -yq unzip >/dev/null 2>&1
     fi
@@ -535,10 +538,10 @@ install_easytier() {
     # 根据 /opt/easytier 目录或命令是否存在，判断是执行安装还是更新
     # 加上 || die 的短路拦截，如果官方脚本中途报错退出，外层脚本立刻阻断并爆红提示
     if [[ -d "/opt/easytier" ]] || command -v easytier-core >/dev/null 2>&1; then
-        info "检测到 Easytier 已安装，正在执行 update 更新操作..."
+        info "检测到 Easytier 已安装，执行 update 更新操作..."
         bash /tmp/easytier-install.sh update $proxy_args || die "Easytier 更新失败，请检查上方报错日志！"
     else
-        info "检测到 Easytier 未安装，正在执行全新安装..."
+        info "检测到 Easytier 未安装，执行全新安装..."
         bash /tmp/easytier-install.sh install $proxy_args || die "Easytier 安装失败，请检查上方报错日志！"
     fi
     
@@ -556,7 +559,7 @@ uninstall_easytier() {
     fi
     bash /tmp/easytier-install.sh uninstall >/dev/null 2>&1
 
-    info "正在执行深度清理..."
+    info "执行深度清理..."
     systemctl stop easytier >/dev/null 2>&1
     systemctl disable easytier >/dev/null 2>&1
     rm -rf /etc/systemd/system/easytier*
@@ -571,7 +574,7 @@ uninstall_easytier() {
     if command -v easytier-core >/dev/null 2>&1; then
         warn "Easytier 环境变量可能仍有残留，请手动检查: $(which easytier-core 2>/dev/null)"
     else
-        info "Easytier 已彻底清理完毕。"
+        info "Easytier 已卸载完毕。"
     fi
 }
 
@@ -589,7 +592,7 @@ uninstall_tailscale() {
     apt-get purge -yq tailscale >/dev/null 2>&1
     
     # 2. 暴力扫荡配置与数据残留
-    info "正在执行深度清理..."
+    info "执行深度清理..."
     rm -rf /var/lib/tailscale \
            /etc/tailscale \
            /usr/bin/tailscale \
@@ -599,169 +602,8 @@ uninstall_tailscale() {
     if command -v tailscale >/dev/null 2>&1; then
         warn "包管理器可能卡死，尝试手动执行强制移除: dpkg --remove --force-all tailscale"
     else
-        info "Tailscale 已彻底清理完毕。"
+        info "Tailscale 已卸载完毕。"
     fi
-}
-
-install_caddy() {
-    info "准备编译并部署带有 layer4 / cloudflare / naiveproxy 插件的 Caddy..."
-    if [[ -f "/usr/bin/caddy" ]]; then
-        warn "检测到 Caddy 已安装，如需重新编译请先卸载。"
-        return
-    fi
-    
-    # 1. 智能切换 Go 语言下载源头
-    local go_domain="go.dev"
-    if [[ "$IS_CN_REGION" == "true" ]]; then
-        go_domain="golang.google.cn" # 墙内可直连的 Go 官方国内镜像
-        info "国内环境拦截，切换 Go 语言源为国内官方镜像: $go_domain"
-    fi
-
-    # 2. 获取 Go 最新版本 (增加 5秒 超时防卡死)
-    GO_LATEST_VERSION=$(curl -s --connect-timeout 5 --max-time 10 "https://${go_domain}/VERSION?m=text" | head -n 1)
-    if [[ -z "$GO_LATEST_VERSION" ]]; then 
-        GO_LATEST_VERSION="go1.22.1"
-        warn "获取 Go 最新版本号超时，将使用保底版本: $GO_LATEST_VERSION"
-    fi
-    
-    info "下载并安装 $GO_LATEST_VERSION (显示下载进度)..."
-    # 废弃静默的 wget，改用 curl 并显示进度条，加入严苛超时控制
-    if ! curl -# -L --connect-timeout 5 -o /tmp/go.tar.gz "https://${go_domain}/dl/${GO_LATEST_VERSION}.linux-amd64.tar.gz"; then
-        die "Go 语言环境下载失败，请检查网络！"
-    fi
-    
-    rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz
-    export PATH=$PATH:/usr/local/go/bin
-    
-    # 3. 智能配置 Go Modules 国内代理 (极其重要，否则编译必卡死)
-    if [[ "$IS_CN_REGION" == "true" ]]; then
-        info "国内环境拦截，配置 GOPROXY 为国内七牛云加速节点..."
-        export GOPROXY=https://goproxy.cn,direct
-    fi
-    
-    # 安装 xcaddy
-    info "安装 xcaddy 编译工具..."
-    go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-    export PATH=$PATH:~/go/bin
-    
-    info "开始编译 Caddy (此过程可能耗时几分钟并消耗较多内存，请耐心等待)..."
-    cd /tmp
-    xcaddy build \
-        --with github.com/mholt/caddy-l4 \
-        --with github.com/caddy-dns/cloudflare \
-        --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
-        
-    if [[ ! -f "./caddy" ]]; then die "Caddy 编译失败，可能是内存不足或网络中断。"; fi
-
-    info "编译成功，开始规范化部署..."
-    mv ./caddy /usr/bin/caddy
-    chmod +x /usr/bin/caddy
-    # 赋予二进制文件绑定 1024 以下低位端口的权限，免去 root 运行的安全隐患
-    setcap cap_net_bind_service=+ep /usr/bin/caddy
-
-    # 创建标准运行环境
-    groupadd --system caddy 2>/dev/null
-    useradd --system --gid caddy --create-home --home-dir /var/lib/caddy --shell /usr/sbin/nologin caddy 2>/dev/null
-    mkdir -p /etc/caddy /etc/ssl/caddy /usr/share/caddy
-    chown -R caddy:root /etc/caddy /etc/ssl/caddy
-    echo "<h1>Caddy Works!</h1>" > /usr/share/caddy/index.html
-
-    cat > /etc/caddy/Caddyfile << 'EOF'
-# ==========================================
-# Caddy 全局配置与入口文件
-# ==========================================
-# 监听 80 端口，配置一个静态文件服务器用于默认展示
-:80 {
-    root * /usr/share/caddy
-    file_server
-}
-# 注意: 你已经编译了 l4 和 naiveproxy 插件
-# 可以在此处添加你的自定义代理配置
-EOF
-
-    cat > /etc/systemd/system/caddy.service << 'EOF'
-# ==========================================
-# Caddy Systemd 守护进程配置文件
-# ==========================================
-[Unit]
-Description=Caddy Web Server
-Documentation=https://caddyserver.com/docs/
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-Type=notify
-# 以低权限系统用户运行，提升安全性
-User=caddy
-Group=caddy
-# 指定运行目录
-ReadWritePaths=/var/log/caddy /var/www/html
-
-ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
-ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
-Restart=on-failure
-TimeoutStopSec=5s
-
-# 资源限制与权限保护
-LimitNOFILE=1048576
-PrivateTmp=true
-ProtectSystem=full
-# 允许 Caddy 绑定 80/443 端口
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    systemctl daemon-reload
-    
-    ufw allow 80/tcp comment 'Caddy HTTP'
-    ufw allow 443/tcp comment 'Caddy HTTPS'
-    ufw allow 443/udp comment 'Caddy HTTP3'
-    
-    info "Caddy (带插件版) 部署成功！已开放 80/443 端口。"
-}
-uninstall_caddy() {
-    info "准备卸载自定义编译版 Caddy..."
-    
-    # 1. 停止服务并清理守护进程
-    systemctl stop caddy >/dev/null 2>&1
-    systemctl disable caddy >/dev/null 2>&1
-    rm -rf /etc/systemd/system/caddy*
-    systemctl daemon-reload
-
-    # 2. 暴力扫荡所有的配置文件、证书目录、Web目录和二进制文件
-    info "正在执行深度清理..."
-    rm -rf /usr/bin/caddy \
-           /usr/local/bin/caddy \
-           /etc/caddy \
-           /usr/share/caddy \
-           /etc/ssl/caddy \
-           /opt/caddy
-
-    if command -v caddy >/dev/null 2>&1; then
-        warn "系统中可能存在通过 apt 安装的官方版，尝试执行: apt purge -yq caddy"
-    else
-        info "自定义 Caddy 已彻底清理完毕。"
-    fi
-}
-uninstall_go() {
-    info "准备卸载 Go 语言环境及编译缓存..."
-    
-    # 检查 Go 是否存在
-    if [[ ! -d "/usr/local/go" ]] && [[ ! -d "$HOME/go" ]]; then
-        warn "系统中未检测到 Go 环境目录 (/usr/local/go 或 ~/go)。"
-        return
-    fi
-
-    # 删除 Go 的安装目录和编译工具链缓存目录
-    rm -rf /usr/local/go
-    rm -rf "$HOME/go"
-    
-    # 清理之前下载遗留的压缩包（如果有的话）
-    rm -f /tmp/go.tar.gz
-
-    info "Go 语言环境及缓存已彻底清除。"
 }
 
 install_warp() {
@@ -786,7 +628,7 @@ uninstall_warp() {
     warp-cli --accept-tos registration delete >/dev/null 2>&1
     apt-get purge -yq cloudflare-warp >/dev/null 2>&1
     
-    info "正在执行深度清理..."
+    info "执行深度清理..."
     rm -f /etc/apt/sources.list.d/cloudflare-client.list
     rm -rf /usr/bin/warp-cli \
            /usr/bin/warp-svc \
@@ -795,7 +637,7 @@ uninstall_warp() {
     if command -v warp-cli >/dev/null 2>&1; then
         warn "包管理器可能卡死，尝试手动执行强制移除: dpkg --remove --force-all cloudflare-warp"
     else
-        info "Cloudflare WARP 已彻底清理完毕。"
+        info "Cloudflare WARP 已清理完毕。"
     fi
 }
 
@@ -815,7 +657,7 @@ install_docker() {
     fi
     
     # 3. 生产环境性能与可用性优化 (配置 daemon.json)
-    info "正在注入 Docker 生产环境性能优化配置..."
+    info "注入 Docker 生产环境性能优化配置..."
     mkdir -p /etc/docker
     
     # 国内环境附加 Registry 镜像加速池 (防 Docker Hub 被墙)
@@ -874,13 +716,13 @@ uninstall_docker() {
     delete_data=${delete_data:-N} 
 
     # 1. 停止所有相关服务
-    info "正在停止 Docker 守护进程..."
+    info "停止 Docker 守护进程..."
     systemctl stop docker >/dev/null 2>&1
     systemctl stop docker.socket >/dev/null 2>&1
     systemctl stop containerd >/dev/null 2>&1
     
     # 2. 包管理器彻底卸载程序本体
-    info "正在卸载 Docker 核心程序包..."
+    info "卸载 Docker 核心程序包..."
     apt-get purge -yq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras >/dev/null 2>&1
     apt-get autoremove -yq >/dev/null 2>&1
     
@@ -890,9 +732,9 @@ uninstall_docker() {
            /var/run/docker.sock \
            /usr/local/bin/docker-compose
 
-    # 4. 【核心分支】根据用户的选择处理数据生命周期
+    # 4. 根据用户的选择处理数据生命周期
     if [[ "$delete_data" =~ ^[Yy]$ ]]; then
-        warn "正在执行毁灭性清理，抹除所有容器、镜像、网络和数据卷..."
+        warn "执行彻底清理，抹除所有容器、镜像、网络和数据卷..."
         rm -rf /var/lib/docker \
                /var/lib/containerd
         info "历史数据已全部清空，释放了所有的磁盘空间。"
@@ -905,7 +747,445 @@ uninstall_docker() {
     if command -v docker >/dev/null 2>&1; then
         warn "包管理器可能卡死，尝试手动执行强制移除: apt purge -y docker-ce"
     else
-        info "Docker 环境已从系统中干净卸载。"
+        info "Docker 环境已卸载完毕。"
+    fi
+}
+
+install_go() {
+    info "开始安装/修复 Go 语言环境..."
+    
+    # 1. 智能切换 Go 语言下载源头
+    local go_domain="go.dev"
+    if [[ "$IS_CN_REGION" == "true" ]]; then
+        go_domain="golang.google.cn" # 墙内可直连的 Go 官方国内镜像
+        info "国内环境拦截，切换 Go 语言源为国内官方镜像: $go_domain"
+    fi
+
+    # 2. 获取 Go 最新版本 (增加 5秒 超时防卡死)
+    GO_LATEST_VERSION=$(curl -s --connect-timeout 5 --max-time 10 "https://${go_domain}/VERSION?m=text" | head -n 1)
+    if [[ -z "$GO_LATEST_VERSION" ]]; then 
+        GO_LATEST_VERSION="go1.22.1"
+        warn "获取 Go 最新版本号超时，将使用保底版本: $GO_LATEST_VERSION"
+    fi
+    
+    info "下载并安装 $GO_LATEST_VERSION (显示下载进度)..."
+    # 废弃静默的 wget，改用 curl 并显示进度条，加入严苛超时控制
+    if ! curl -# -L --connect-timeout 5 -o /tmp/go.tar.gz "https://${go_domain}/dl/${GO_LATEST_VERSION}.linux-amd64.tar.gz"; then
+        die "Go 语言环境下载失败，请检查网络！"
+    fi
+    
+    rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz
+    export PATH=$PATH:/usr/local/go/bin
+    
+    # 3. 智能配置 Go Modules 国内代理 (极其重要，否则编译必卡死)
+    if [[ "$IS_CN_REGION" == "true" ]]; then
+        info "国内环境拦截，配置 GOPROXY 为国内七牛云加速节点..."
+        export GOPROXY=https://goproxy.cn,direct
+    fi
+    
+    info "Go 语言环境安装/修复成功！"
+}
+uninstall_go() {
+    info "准备卸载 Go 语言环境及编译缓存..."
+    
+    # 检查 Go 是否存在
+    if [[ ! -d "/usr/local/go" ]] && [[ ! -d "$HOME/go" ]]; then
+        warn "系统中未检测到 Go 环境目录 (/usr/local/go 或 ~/go)。"
+        return
+    fi
+
+    # 删除 Go 的安装目录和编译工具链缓存目录
+    rm -rf /usr/local/go
+    rm -rf "$HOME/go"
+    
+    # 清理之前下载遗留的压缩包（如果有的话）
+    rm -f /tmp/go.tar.gz
+
+    # 2. 暴力扫荡配置与数据残留
+    info "执行深度清理..."
+    rm -rf /var/lib/go \
+           /etc/go \
+           /usr/bin/go \
+           /usr/sbin/go \
+           /opt/go
+
+    info "Go 语言环境及缓存已卸载完毕。"
+}
+
+install_caddy() {
+    local is_update="false"
+    local was_running="false"
+    
+    # 智能状态侦测
+    if command -v caddy >/dev/null 2>&1 || [[ -f "/usr/bin/caddy" ]]; then
+        is_update="true"
+        info "检测到 Caddy 已安装，准备拉取最新源码进行编译更新..."
+        # 记录更新前服务是否处于运行状态
+        if systemctl is-active --quiet derper; then
+            was_running="true"
+        fi
+    else
+        info "准备编译并部署带有 layer4 / cloudflare / naiveproxy 插件的 Caddy..."
+    fi
+
+    # 确保 Go 环境已就绪
+    if ! command -v go >/dev/null 2>&1; then
+        die "未检测到 Go 环境！请先在当前菜单选择【1. 安装 Go 环境】。"
+    fi
+    
+    # 确保国内编译环境不卡死
+    [[ "$IS_CN_REGION" == "true" ]] && export GOPROXY=https://goproxy.cn,direct
+    
+    # 安装 xcaddy
+    info "安装 xcaddy 编译工具..."
+    go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+    export PATH=$PATH:~/go/bin
+    
+    info "开始编译 Caddy (此过程可能耗时几分钟并消耗较多内存，请耐心等待)..."
+    cd /tmp
+    xcaddy build \
+        --with github.com/mholt/caddy-l4 \
+        --with github.com/caddy-dns/cloudflare \
+        --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
+        
+    if [[ ! -f "./caddy" ]]; then die "Caddy 编译失败，可能是内存不足或网络中断。"; fi
+
+    info "编译成功，开始规范化部署..."
+    # 仅在编译成功后才停机替换，将业务中断时间降至最低
+    systemctl stop caddy >/dev/null 2>&1
+    mv ./caddy /usr/bin/caddy
+    chmod +x /usr/bin/caddy
+    # 赋予二进制文件绑定 1024 以下低位端口的权限，免去 root 运行的安全隐患
+    setcap cap_net_bind_service=+ep /usr/bin/caddy
+
+    # 只有在全新安装时，才初始化用户和配置文件
+    if [[ "$is_update" == "false" ]]; then
+        # 创建标准运行环境
+        groupadd --system caddy 2>/dev/null
+        useradd --system --gid caddy --create-home --home-dir /var/lib/caddy --shell /usr/sbin/nologin caddy 2>/dev/null
+        mkdir -p /etc/caddy /etc/ssl/caddy /usr/share/caddy
+        chown -R caddy:root /etc/caddy /etc/ssl/caddy
+        echo "<h1>Caddy Works!</h1>" > /usr/share/caddy/index.html
+
+        cat > /etc/caddy/Caddyfile << 'EOF'
+# ==========================================
+# Caddy 全局配置与入口文件
+# ==========================================
+# 监听 80 端口，配置一个静态文件服务器用于默认展示
+:80 {
+    root * /usr/share/caddy
+    file_server
+}
+# 注意: 你已经编译了 l4 和 naiveproxy 插件
+# 可以在此处添加你的自定义代理配置
+EOF
+
+        cat > /etc/systemd/system/caddy.service << 'EOF'
+# ==========================================
+# Caddy Systemd 守护进程配置文件
+# ==========================================
+[Unit]
+Description=Caddy Web Server
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+# 以低权限系统用户运行，提升安全性
+User=caddy
+Group=caddy
+# 指定运行目录
+ReadWritePaths=/var/log/caddy /var/www/html
+
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+Restart=on-failure
+TimeoutStopSec=5s
+
+# 资源限制与权限保护
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+# 允许 Caddy 绑定 80/443 端口
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+        systemctl daemon-reload
+        
+        ufw allow 80/tcp comment 'Caddy HTTP'
+        ufw allow 443/tcp comment 'Caddy HTTPS'
+        ufw allow 443/udp comment 'Caddy HTTP3'
+        
+        info "Caddy (带插件版) 部署成功！已开放 80/443 端口。"
+    else
+        info "Caddy 更新完成，您的自定义 Caddyfile 已被安全保留！"
+        # 智能拉起：如果更新前它是运行的，更新后自动拉起；如果是关闭的，保持关闭。
+        if [[ "$was_running" == "true" ]]; then
+            systemctl start caddy
+            info "检测到更新前服务处于运行状态，已自动重启 Caddy 服务。"
+        fi
+    fi
+}
+uninstall_caddy() {
+    info "准备卸载自定义编译版 Caddy..."
+    
+    # 1. 停止服务并清理守护进程
+    systemctl stop caddy >/dev/null 2>&1
+    systemctl disable caddy >/dev/null 2>&1
+    rm -rf /etc/systemd/system/caddy*
+    systemctl daemon-reload
+
+    # 2. 暴力扫荡所有的配置文件、证书目录、Web目录和二进制文件
+    info "执行深度清理..."
+    rm -rf /usr/bin/caddy \
+           /usr/local/bin/caddy \
+           /etc/caddy \
+           /usr/share/caddy \
+           /etc/ssl/caddy \
+           /opt/caddy
+
+    if command -v caddy >/dev/null 2>&1; then
+        warn "系统中可能存在通过 apt 安装的官方版，尝试执行: apt purge -yq caddy"
+    else
+        info "自定义 Caddy 已卸载完毕。"
+    fi
+}
+
+install_derper() {
+    local is_update="false"
+    local was_running="false"
+
+    # === 自定义配置区 ===
+    local DERP_PORT=34781          # 推荐使用高位端口防扫描
+    local TS_VERSION="v1.94.2"     # 必须锁定版本，防止官方源码变动导致魔改失败
+    # ====================
+
+    # 智能状态侦测
+    if command -v derper >/dev/null 2>&1 || [[ -f "/usr/bin/derper" ]]; then
+        is_update="true"
+        info "检测到 Tailscale DERPer 已安装，准备拉取最新源码进行编译更新..."
+        # 记录更新前服务是否处于运行状态
+        if systemctl is-active --quiet derper; then
+            was_running="true"
+        fi
+    else
+        info "开始自编译安装 Tailscale DERPer (添加隐身补丁)..."
+    fi
+
+    # 1. 确保 Go 环境已就绪
+    if ! command -v go >/dev/null 2>&1; then
+        die "未检测到 Go 环境！请先在当前菜单选择【1. 安装 Go 环境】。"
+    fi
+    [[ "$IS_CN_REGION" == "true" ]] && export GOPROXY=https://goproxy.cn,direct
+
+    # 2. 智能配置 GitHub 镜像源与底层网络参数 (防 curl 16 报错)
+    local repo_url="https://github.com/tailscale/tailscale.git"
+    if [[ "$IS_CN_REGION" == "true" ]]; then
+        info "国内环境拦截，自动切换至 GitHub 镜像加速源..."
+        repo_url="https://ghfast.top/https://github.com/tailscale/tailscale.git"
+        
+        # 强制降级到 HTTP/1.1 并放大缓冲区，彻底解决 HTTP/2 framing layer 断流问题
+        git config --global http.version HTTP/1.1
+        git config --global http.postBuffer 524288000
+    fi
+
+    info "拉取 Tailscale $TS_VERSION 源码..."
+    rm -rf /tmp/derp_build && mkdir -p /tmp/derp_build
+    cd /tmp/derp_build
+    
+    # 加入拉取失败的拦截与提示
+    if ! git clone -b $TS_VERSION --depth 1 "$repo_url"; then
+        die "源码拉取失败！国内镜像源可能存在短暂波动，请稍后重试。"
+    fi
+    cd tailscale/cmd/derper
+
+    info "执行源码魔改 (添加隐身防拨测功能)..."
+
+    # --- 魔改 0: 修改 cert.go，去掉主机名与 ServerName 不匹配时的拦截
+    # 这允许我们在客户端直接通过 IP 连接而不会因为证书 SNI 校验失败而断开
+    # 使用 .* 泛匹配，无论官方的 if 条件写得多复杂，全部强制替换为 if false {
+    #sed -i 's/if hi.ServerName != m.hostname.*/if false {/' cert.go
+
+    # --- 魔改 1: 注入强制断开底层 TCP 连接的 closeConn 函数 ---
+    sed -i '/func main()/i \
+func closeConn(w http.ResponseWriter) {\
+\tif hj, ok := w.(http.Hijacker); ok {\
+\t\tif conn, _, err := hj.Hijack(); err == nil {\
+\t\t\tconn.Close()\
+\t\t}\
+\t}\
+}\
+' derper.go
+
+    # --- 魔改 2: 严格校验 /generate_204 路由 (仅放行官方 UA) ---
+    # 双通道匹配：兼容老版本的 derphttp 和新版本的 derpserver 包名
+    sed -i 's/mux.HandleFunc("\/generate_204", derphttp.ServeNoContent)/mux.HandleFunc("\/generate_204", func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.UserAgent() == "Go-http-client\/1.1" {\n\t\t\tderphttp.ServeNoContent(w, r)\n\t\t\treturn\n\t\t}\n\t\tcloseConn(w)\n\t})/g' derper.go
+    sed -i 's/mux.HandleFunc("\/generate_204", derpserver.ServeNoContent)/mux.HandleFunc("\/generate_204", func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.UserAgent() == "Go-http-client\/1.1" {\n\t\t\tderpserver.ServeNoContent(w, r)\n\t\t\treturn\n\t\t}\n\t\tcloseConn(w)\n\t})/g' derper.go
+
+    # --- 魔改 3: 掐断根路径 / (禁止浏览器访问返回 DERP) ---
+    # 防患于未然：同时兼容 fmt.Fprintf 和 io.WriteString
+    sed -i 's/fmt.Fprintf(w, "DERP\\n")/closeConn(w)/g' derper.go
+    sed -i 's/io.WriteString(w, "DERP\\n")/closeConn(w)/g' derper.go
+
+    # --- 魔改 4: 严格校验核心握手路径 /derp (无 Upgrade 头直接阻断) ---
+    # 双通道匹配：同样兼容 derphttp 和 derpserver 的 Handler 包装
+    sed -i 's/mux.Handle("\/derp", derphttp.Handler(s))/mux.HandleFunc("\/derp", func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get("Upgrade") != "derp" {\n\t\t\tcloseConn(w)\n\t\t\treturn\n\t\t}\n\t\tderphttp.Handler(s).ServeHTTP(w, r)\n\t})/g' derper.go
+    sed -i 's/mux.Handle("\/derp", derpserver.Handler(s))/mux.HandleFunc("\/derp", func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get("Upgrade") != "derp" {\n\t\t\tcloseConn(w)\n\t\t\treturn\n\t\t}\n\t\tderpserver.Handler(s).ServeHTTP(w, r)\n\t})/g' derper.go
+    
+    # 防漏校验机制
+    # 如果未来官方大改了源码导致 sed 替换失败，这里会立刻拦截，防止编译出裸奔节点
+    #if ! grep -q "closeConn(w)" derper.go || ! grep -q "if false {" cert.go; then
+    if ! grep -q "closeConn(w)" derper.go; then
+        die "源码魔改失败！你当前指定的 Tailscale 版本 ($TS_VERSION) 源码结构已改变，隐身补丁无法打入。请降级版本或手动查阅源码更新 sed 命令。"
+    fi
+    info "代码魔改校验通过！隐身补丁已成功注入。"
+    
+    info "开始编译 DERPer (此过程可能耗时几分钟并消耗较多内存，请耐心等待)..."
+    # 编译到独立的临时文件，防止影响当前运行的服务
+    go build -o /tmp/derper_new
+    
+    if [[ ! -f "/tmp/derper_new" ]]; then
+        die "DERPer 编译失败！请检查系统环境或源码状态。"
+    fi
+
+    info "编译成功，开始规范化部署..."
+    systemctl stop derper >/dev/null 2>&1
+    mv /tmp/derper_new /usr/bin/derper
+    chmod +x /usr/bin/derper
+    
+    info "探测服务器双栈公网 IP..."
+        
+    # 严格轮询获取 IPv4 (加 -4 参数，并通过正则校验)
+    local server_ipv4=""
+    for api in "https://api.ipify.org" "https://ipv4.icanhazip.com" "https://ifconfig.me/ip"; do
+        server_ipv4=$(curl -s4 --connect-timeout 3 "$api")
+        if [[ "$server_ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            break
+        fi
+        server_ipv4=""
+    done
+
+    # 通过本地网卡直接获取公网 IPv6 (排除 Tailscale 虚拟内网及本地链路地址)
+    local server_ipv6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | grep -v -E "^(fd|fc)" | head -n 1)
+
+    if [[ -z "$server_ipv4" ]]; then
+        warn "未能自动检测到公网 IPv4，将回退到 127.0.0.1，请随后手动修改证书和配置！"
+        server_ipv4="127.0.0.1"
+    fi
+
+    info "✅ 绑定 IPv4: ${server_ipv4}"
+    [[ -n "$server_ipv6" ]] && info "✅ 绑定 IPv6: ${server_ipv6}" || info "⚠️ 未检测到可用 IPv6 路由，仅配置单栈。"
+    
+    # 只有全新安装时，才生成自签证书和服务文件，执行精准双栈 IP 探测
+    if [[ "$is_update" == "false" ]]; then
+        info "生成带 IP SAN 的自签证书与身份密钥..."
+        local derp_dir="/opt/derper"
+        local cert_dir="${derp_dir}/certs"
+        mkdir -p "$cert_dir"
+
+        # 动态拼接证书 SAN 扩展，让证书同时被 IPv4 和 IPv6 信任
+        local san_ext="subjectAltName=IP:${server_ipv4}"
+        if [[ -n "$server_ipv6" ]]; then
+            san_ext="${san_ext},IP:${server_ipv6}"
+        fi
+
+        # 注意：文件命名依然使用 ipv4.key，因为 systemd 中 -hostname 传入的是 ipv4
+        openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+            -keyout "${cert_dir}/${server_ipv4}.key" -out "${cert_dir}/${server_ipv4}.crt" \
+            -subj "/CN=${server_ipv4}" -addext "${san_ext}" >/dev/null 2>&1
+
+        cat > /etc/systemd/system/derper.service << EOF
+[Unit]
+Description=Tailscale DERP Relay Server (Stealth Mode)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/derper -a :${DERP_PORT} -hostname ${server_ipv4} -certmode manual -certdir ${cert_dir} -stun -http-port -1 -verify-clients=false
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        
+        # 放行防火墙
+        ufw allow ${DERP_PORT}/tcp comment 'DERP Relay Stealth' >/dev/null 2>&1
+        ufw allow 3478/udp comment 'DERP STUN' >/dev/null 2>&1
+
+        info "DERPer 隐身版部署成功！"
+        info "1. 二进制路径: /usr/bin/derper"
+        info "2. 证书路径: ${cert_dir}"
+        info "3. 中继端口: TCP ${DERP_PORT} | STUN: UDP 3478"
+        warn "服务已生成但未开启。请检查配置后执行: systemctl start derper"
+    else
+        info "DERPer 二进制文件更新成功！您的自签证书和服务配置已安全保留。"
+        # 智能拉起：如果更新前它是运行的，更新后自动拉起；如果是关闭的，保持关闭。
+        if [[ "$was_running" == "true" ]]; then
+            systemctl start derper
+            info "检测到更新前服务处于运行状态，已自动重启 DERPer 服务。"
+        fi
+    fi
+            
+    # 动态生成带有（或不带有） IPv6 字段的 JSON
+    local ipv6_json=""
+    if [[ -n "$server_ipv6" ]]; then
+        ipv6_json=",\n                    \"IPv6\": \"${server_ipv6}\""
+    fi
+
+    # 给用户打印出控制台配置代码，方便复制
+    echo -e "\n${YELLOW}================================================================${NC}"
+    echo -e "${GREEN}请自行修改以下配置后加入到 Tailscale 控制台的 Access Controls (ACLs) 中：${NC}"
+    echo -e "${YELLOW}
+\"derpMap\": {
+    \"OmitDefaultRegions\": false,
+    \"Regions\": {
+        \"901\": {
+            \"RegionID\": 901,
+            \"RegionCode\": \"MyDerp\",
+            \"RegionName\": \"My Stealth Node\",
+            \"Nodes\": [
+                {
+                    \"Name\": \"1\",
+                    \"RegionID\": 901,
+                    \"Hostname\": \"${server_ipv4}\"
+                    \"IPv4\": \"${server_ipv4}\"${ipv6_json},
+                    \"DERPPort\": ${DERP_PORT},
+                    \"InsecureForTests\": true
+                    \\\"STUNOnly\": true
+                }
+            ]
+        }
+    }
+}${NC}"
+    echo -e "${GREEN}若要 DERPer 仅辅助打洞而不中继流量，请在服务器手动禁用 DERP 公网端口并在控制台取消 STUNOnly 注释${NC}"
+    echo -e "${YELLOW}================================================================${NC}\n"
+}
+uninstall_derper() {
+    info "准备卸载 Tailscale DERPer..."
+    
+    systemctl stop derper >/dev/null 2>&1
+    systemctl disable derper >/dev/null 2>&1
+    rm -f /etc/systemd/system/derper.service
+    systemctl daemon-reload
+
+    info "清理残留文件..."
+    rm -f /usr/bin/derper
+    rm -rf /opt/derper
+    rm -rf /tmp/derp_build
+
+    # 检查状态
+    if command -v derper >/dev/null 2>&1; then
+        warn "DERPer 仍有残留，请手动清理 /usr/bin/derper。"
+    else
+        info "DERPer 已卸载完毕。"
     fi
 }
 
@@ -967,6 +1247,49 @@ handle_submenu() {
     done
 }
 
+handle_go_submenu() {
+    while true; do
+        clear
+        echo -e "\n=============================================="
+        echo -e "      【 GoLang 环境与编译组件管理 】"
+        echo -e "=============================================="
+        
+        # 动态判定：如果 Go 安装了，显示高级选项；没装，只显示安装
+        if command -v go >/dev/null 2>&1 || [[ -d "/usr/local/go" ]]; then
+            echo " 1. 修复/更新 Go 环境"
+            echo -e " ---------------------------------------------"
+            echo -e " 2. 自定义 Caddy    $(get_status caddy)"
+            echo -e " 3. Tailscale DERP  $(get_status derper)"
+            echo " ---------------------------------------------"
+            echo " 4. 卸载 Go 环境"
+            echo -e " ---------------------------------------------"
+            echo " 0. 返回主菜单"
+            echo -e "=============================================="
+            read -p "请输入对应数字: " sub_choice
+            
+            case $sub_choice in
+                1) install_go; pause;;
+                2) handle_submenu "自定义 Caddy" install_caddy uninstall_caddy;;
+                3) handle_submenu "Tailscale DERP" install_derper uninstall_derper;;
+                4) uninstall_go; pause; break;; # 卸载 Go 后退回主菜单以刷新全局状态
+                0) break;;
+                *) echo "无效选项，请重新输入。"; sleep 1;;
+            esac
+        else
+            echo " 1. 安装 Go 环境 (用于编译自定义 Go 应用)"
+            echo " 0. 返回主菜单"
+            echo -e "=============================================="
+            read -p "请输入对应数字: " sub_choice
+            
+            case $sub_choice in
+                1) install_go; pause;;
+                0) break;;
+                *) echo "无效选项，请重新输入。"; sleep 1;;
+            esac
+        fi
+    done
+}
+
 show_main_menu() {
     while true; do
         # 判断当前的持久化网络环境以供显示
@@ -981,30 +1304,31 @@ show_main_menu() {
         echo -e "      Debian 全能调优与服务部署管理面板"
         echo -e "      网络环境: ${net_status_text}"
         echo -e "=============================================="
-        echo " 1. 一键系统基础优化 (防重复执行保护已开启)"
+        echo " 1. 一键系统基础优化 (可重复执行)"
+        echo -e " 2. 切换 IP 转发状态 当前: $(get_ip_forward_status)"
         echo -e "---------------------------------------------"
-        echo -e " 2. Xray Core       $(get_status xray)"
-        echo -e " 3. Easytier        $(get_status easytier-core)"
-        echo -e " 4. Tailscale       $(get_status tailscale)"
-        echo -e " 5. 自编译 Caddy    $(get_status caddy)"
+        echo -e " 3. Xray Core       $(get_status xray)"
+        echo -e " 4. Easytier        $(get_status easytier-core)"
+        echo -e " 5. Tailscale       $(get_status tailscale)"
         echo -e " 6. CF WARP 代理    $(get_status warp-cli)"
         echo -e " 7. Docker 环境     $(get_status docker)"
         echo -e " ---------------------------------------------"
-        echo -e " 8. 切换 IP 转发状态 当前: $(get_ip_forward_status)"
+        echo -e " 8. GoLang 环境     $(get_status go)"
+        echo -e " ---------------------------------------------"
         echo " 0. 退出脚本"
         echo -e "=============================================="
         read -p "请输入对应的数字选项: " choice
         
         case $choice in
             1) run_base_optimization; pause;;
-            2) handle_submenu "Xray Core" install_xray uninstall_xray;;
-            3) handle_submenu "Easytier" install_easytier uninstall_easytier;;
-            4) handle_submenu "Tailscale" install_tailscale uninstall_tailscale;;
-            5) handle_submenu "Caddy (带插件)" install_caddy uninstall_caddy "清理 Go 编译环境" uninstall_go;;
+            2) toggle_ip_forwarding; pause;;
+            3) handle_submenu "Xray Core" install_xray uninstall_xray;;
+            4) handle_submenu "Easytier" install_easytier uninstall_easytier;;
+            5) handle_submenu "Tailscale" install_tailscale uninstall_tailscale;;
             6) handle_submenu "CF WARP" install_warp uninstall_warp;;
             7) handle_submenu "Docker & Compose" install_docker uninstall_docker;;
-            8) toggle_ip_forwarding; pause;;
-            0) echo "退出脚本。再见！"; exit 0;;
+            8) handle_go_submenu;;
+            0) echo "退出脚本，下次见 :)"; exit 0;;
             *) echo "无效选项，请重新输入。"; sleep 1;;
         esac
     done

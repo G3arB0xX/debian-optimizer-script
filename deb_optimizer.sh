@@ -1,6 +1,6 @@
 #!/bin/bash
 # =========================================================
-# Debian 全能自动化部署与性能调优脚本 (高安全与高可用最终版)
+# Debian 系统性能调优与服务自动化部署面板
 # 适用系统: Debian 11 / Debian 12 (amd64)
 # 特性: 幂等性设计、防重复执行、详尽系统级注释、可选组件自动构建
 # =========================================================
@@ -474,7 +474,7 @@ EOF
 install_xray() {
     info "开始安装/更新 Xray Core..."
     download_with_fallback "/tmp/xray-install.sh" "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"|| return 1
-    bash /tmp/xray-install.sh install
+    bash /tmp/xray-install.sh install -u root
     if systemctl is-active --quiet xray; then
         info "Xray 安装成功并已运行！"
     else
@@ -681,30 +681,119 @@ install_warp() {
     apt-get update -yq >/dev/null 2>&1 || { err "APT 源更新失败，请检查系统源配置！"; return 1; }
     apt-get install -yq cloudflare-warp || { err "WARP 客户端安装/更新失败！"; return 1; }
 
+    # 清理可能导致 Systemd 幽灵报错的残留空文件
+    if [[ -f "/etc/systemd/system/warp-svc.service" && ! -L "/etc/systemd/system/warp-svc.service" ]]; then
+        rm -f "/etc/systemd/system/warp-svc.service"
+        systemctl daemon-reload
+    fi
+
+    # 确保基础服务被成功拉起，并等待 Socket 接口就绪
+    info "等待 WARP 基础守护进程初始化..."
+    systemctl unmask warp-svc >/dev/null 2>&1
+    systemctl enable --now warp-svc >/dev/null 2>&1
+    
+    local retry=0
+    while ! warp-cli --accept-tos status >/dev/null 2>&1; do
+        sleep 1
+        ((retry++))
+        if [[ $retry -ge 10 ]]; then
+            err "WARP 守护进程启动超时，无法建立本地通信 Socket！"
+            return 1
+        fi
+    done
+
     # 4. 差异化配置与容错处理
     if [[ "$is_update" == "false" ]]; then
-        info "首次安装，正在注册并配置 WARP (监听端口: 40000)..."
+        info "首次安装，注册并配置 WARP 为代理模式..."
         
         # 国内机器注册极大可能失败，这里进行重点捕获
+        # 注册阶段会消耗较多内存进行密码学运算，因此必须在限制内存前执行
         warp-cli --accept-tos registration new >/dev/null 2>&1 || { 
-            err "WARP 注册失败！"
-            warn "这通常是因为 Cloudflare API 在国内被阻断。请考虑开启全局代理后再试，或放弃安装 WARP。"
+            err "WARP 注册失败！这通常是因为 Cloudflare API 在国内被阻断。请考虑开启全局代理后再试。"
             return 1 
         }
-        
+
+        # 核心阉割指令
+        # 协议降维与去除遥测
+        info "修改隧道协议为WireGuard并去除遥测组件..."
+        # 强制使用轻量的 WireGuard 协议，停用复杂的 MASQUE (HTTP/3) 协议
+        warp-cli --accept-tos tunnel protocol set WireGuard >/dev/null 2>&1
+        # 关闭家庭过滤/防注入等额外 DNS 开销
+        warp-cli --accept-tos dns families off >/dev/null 2>&1
+        warp-cli --accept-tos dns log disable >/dev/null 2>&1
+
         warp-cli --accept-tos mode proxy >/dev/null 2>&1 || { err "WARP 设置代理模式失败！"; return 1; }
         warp-cli --accept-tos proxy port 40000 >/dev/null 2>&1 || { err "WARP 设置代理端口失败！"; return 1; }
         warp-cli --accept-tos connect >/dev/null 2>&1 || { err "WARP 启动连接失败！"; return 1; }
-        
-        info "WARP 全新配置完成！本地 Socks5 代理位于: 127.0.0.1:40000"
     else
-        info "WARP 更新包安装完成！正在验证守护进程状态..."
-        
-        # 更新时无需重新注册设备和改端口，只需要确保连接被重新拉起
-        warp-cli --accept-tos connect >/dev/null 2>&1 || warn "WARP 重新拉起连接失败！请随后手动使用 'warp-cli status' 检查状态。"
-        
-        info "WARP 更新成功！Socks5 代理依然位于: 127.0.0.1:40000"
+        info "WARP 更新包安装完成！正在验证并重新下发优化指令..."
+        warp-cli --accept-tos tunnel protocol set WireGuard >/dev/null 2>&1
+        warp-cli --accept-tos dns families off >/dev/null 2>&1
+        warp-cli --accept-tos dns log disable >/dev/null 2>&1
+        warp-cli --accept-tos connect >/dev/null 2>&1
     fi
+    
+    # Systemd 级性能与内存优化
+    info "正在检查并注入系统级性能限制与日志静音..."
+    local need_restart="false"
+
+    # 检查并按需生成 Systemd 覆盖文件
+    mkdir -p /etc/systemd/system/warp-svc.service.d
+    local override_file="/etc/systemd/system/warp-svc.service.d/override.conf"
+    # 如果文件不存在，或者文件内容不包含我们设定的 MemoryHigh，才执行覆写
+    if [[ ! -f "$override_file" ]] || ! grep -q "MemoryHigh=80M" "$override_file"; then
+        cat > "$override_file" << EOF
+[Service]
+# 达到 80M 时内核疯狂执行 GC 回收
+MemoryHigh=80M
+# 超过 120M 直接 OOM 击杀防卡死
+MemoryMax=120M
+# 崩溃后延迟 5 秒重启，防 CPU 飙升
+RestartSec=5s
+# 屏蔽 journald 抓取 WARP 的调试和冗余输出
+LogLevelMax=error
+EOF
+        need_restart="true"
+        info "已注入 Systemd 内存与日志限制规则。"
+    fi
+
+    # 将 WARP 私有的统计和日志文件全部软链接到黑洞，彻底斩断磁盘 I/O 遥测
+    mkdir -p /var/log/cloudflare-warp
+    local log_file="/var/log/cloudflare-warp/cfwarp_service_log.txt"
+    local stats_file="/var/log/cloudflare-warp/cfwarp_service_stats.txt"
+    # 检查软链接状态，按需切断物理日志
+    if [[ $(readlink "$log_file") != "/dev/null" || $(readlink "$stats_file") != "/dev/null" ]]; then
+        rm -f "$log_file" "$stats_file"
+        ln -sf /dev/null "$log_file"
+        ln -sf /dev/null "$stats_file"
+        need_restart="true"
+        info "已将遥测与诊断日志重定向至 /dev/null。"
+    fi
+
+
+    # 只有当配置真正发生改变时，才执行耗时且会打断业务的 reload 和 restart
+    if [[ "$need_restart" == "true" ]]; then
+        info "优化配置已变更，重启 warp-svc 以应用新配置..."
+        # 重载 systemd 使性能锁生效
+        systemctl daemon-reload
+        systemctl restart warp-svc
+
+        # 再次轮询等待 Socket 重连，彻底消除闪断报错
+        retry=0
+        while ! warp-cli --accept-tos status >/dev/null 2>&1; do
+            sleep 1
+            ((retry++))
+            if [[ $retry -ge 10 ]]; then
+                err "WARP 重启后失去响应，请检查系统日志！"
+                return 1
+            fi
+        done
+        info "优化配置应用成功！"
+    else
+        info "系统级性能限制已设置，无需重复应用。"
+    fi
+
+    info "WARP 全局配置与优化完成，Socks5 代理位于: 127.0.0.1:40000"
 }
 uninstall_warp() {
     info "准备卸载 Cloudflare WARP 客户端..."
@@ -712,18 +801,321 @@ uninstall_warp() {
     warp-cli --accept-tos disconnect >/dev/null 2>&1
     warp-cli --accept-tos registration delete >/dev/null 2>&1
     apt-get purge -yq cloudflare-warp >/dev/null 2>&1
-    
+
     info "执行深度清理..."
     rm -f /etc/apt/sources.list.d/cloudflare-client.list
     rm -rf /usr/bin/warp-cli \
            /usr/bin/warp-svc \
-           /opt/cloudflare-warp
+           /opt/cloudflare-warp \
+           /etc/systemd/system/warp-svc.service.d
 
     if command -v warp-cli >/dev/null 2>&1; then
         warn "包管理器可能卡死，尝试手动执行强制移除: dpkg --remove --force-all cloudflare-warp"
     else
-        info "Cloudflare WARP 已清理完毕。"
+        info "Cloudflare WARP 已卸载完毕。"
     fi
+}
+install_usque() {
+    local is_update="false"
+    local was_running="false"
+
+    # 1. 状态感知与生命周期管理
+    if [[ -f "/opt/usque/usque" ]]; then
+        is_update="true"
+        info "检测到 Usque 已安装，准备拉取最新版进行更新..."
+        # 精准记忆更新前的运行状态
+        if systemctl is-active --quiet usque; then
+            was_running="true"
+            info "检测到 Usque 服务正在运行，更新后将自动重启服务。"
+        else
+            info "检测到 Usque 服务处于停止状态，更新后将保持停止。"
+        fi
+    else
+        info "开始全新安装 Usque (轻量级 WARP MASQUE 客户端)..."
+    fi
+
+    # 2. 本地依赖检查
+    if ! command -v jq >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+        info "正在安装必要依赖 (jq, unzip)..."
+        apt-get update -yq >/dev/null 2>&1
+        apt-get install -yq jq unzip || { err "依赖安装失败，请尝试手动安装！"; return 1; }
+    fi
+
+    # 3. 跨架构自适应支持 (完美兼容 AMD64 和 ARM64)
+    local arch=""
+    case $(uname -m) in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) err "不支持的系统架构: $(uname -m)"; return 1 ;;
+    esac
+
+    # 4. 动态解析 GitHub 最新 Release
+    info "正在查询 GitHub 获取最新版下载链接..."
+    local api_url="https://api.github.com/repos/Diniboy1123/usque/releases/latest"
+    # 增加超时限制，防止国内机器卡死
+    local release_json=$(curl -sSL --connect-timeout 10 "$api_url")
+    
+    # 巧妙利用 jq 的 select 语法，不再硬编码版本号，永远锁定最新的 linux_架构.zip
+    local dl_url=$(echo "$release_json" | jq -r ".assets[] | select(.name | contains(\"linux_${arch}.zip\")) | .browser_download_url 2>/dev/null")
+
+    if [[ -z "$dl_url" || "$dl_url" == "null" ]]; then
+        err "获取 Usque 下载链接失败！可能遇到了 GitHub API 限流，请稍后再试。"
+        return 1
+    fi
+
+    # 5. 沙盒化下载与部署
+    mkdir -p /opt/usque
+    local temp_dir="/tmp/usque_install_$$"
+    mkdir -p "$temp_dir"
+    cd "$temp_dir" || return 1
+    
+    # 无论成功与否，退出函数时彻底销毁临时沙盒
+    trap 'rm -rf "$temp_dir"' EXIT
+
+    info "下载核心文件..."
+    # 完美复用我们的 fallback 下载函数，无视国内墙的阻力
+    download_with_fallback "usque.zip" "$dl_url" || { err "Usque 下载失败！请检查网络。"; return 1; }
+    
+    info "解压并部署二进制文件..."
+    unzip -q usque.zip || { err "解压失败！压缩包可能已损坏。"; return 1; }
+    
+    # 强行覆盖目标目录并赋权
+    mv -f usque /opt/usque/usque
+    chmod +x /opt/usque/usque
+
+    # 6. 交互式 JWT 注册 (仅在全新安装或缺失配置时触发)
+    if [[ "$is_update" == "false" || ! -f "/opt/usque/config.json" ]]; then
+        echo -e "\n${YELLOW}================================================================${NC}"
+        echo -e "${GREEN}Usque 支持通过 Zero Trust 的 JWT Token 直接生成 MASQUE 高级配置。${NC}"
+        echo -e "您可以在浏览器登录 Cloudflare Zero Trust 抓取 Token (通常以 eyJ 开头)。"
+        echo -e "${YELLOW}================================================================${NC}"
+        read -p "请输入您的完整 JWT Token (或直接按回车跳过自动注册): " jwt_token
+
+        if [[ -n "$jwt_token" ]]; then
+            info "正在向 Cloudflare 注册设备，请稍候..."
+            cd /opt/usque || return 1
+            if ./usque register --jwt "$jwt_token" --accept-tos >/dev/null 2>&1; then
+                info "✅ 设备注册成功！已在 /opt/usque 目录下生成 config.json。"
+            else
+                warn "注册失败！Token 可能无效或网络环境受限。您可以随后手动运行注册命令。"
+            fi
+        else
+            info "已跳过自动注册，您可以随后在 /opt/usque 目录下手动执行 register 命令。"
+        fi
+    fi
+
+    # 7. Systemd 守护进程配置 (每次安装/更新都会幂等覆写以保证配置最新)
+    info "配置 Systemd 守护进程..."
+    cat > /etc/systemd/system/usque.service << EOF
+[Unit]
+Description=Usque MASQUE Client (SOCKS5 Proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/usque
+ExecStart=/opt/usque/usque socks -b 127.0.0.1 -p 40001
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+
+    # 8. 绝对严谨的状态流转
+    if [[ "$is_update" == "true" ]]; then
+        if [[ "$was_running" == "true" ]]; then
+            info "检测到更新前服务正在运行，正在重启 usque 服务应用新版本..."
+            systemctl restart usque
+            info "✅ Usque 更新并重启成功！"
+        else
+            info "✅ Usque 更新成功！(服务依然保持停止状态)"
+        fi
+    else
+        info "✅ Usque 全新安装成功！默认 socks5 代理端口为 40001"
+        info "请手动执行命令启用 Usque 服务: ${YELLOW}systemctl enable usque --now${NC}"
+    fi
+}
+uninstall_usque() {
+    if [[ ! -f "/opt/usque/usque" && ! -f "/etc/systemd/system/usque.service" ]]; then
+        warn "Usque 未安装，无需卸载。"
+        return 0
+    fi
+
+    echo -e "\n${YELLOW}警告: 此操作将彻底删除 Usque 及其所有配置文件 (包括 config.json 中的私钥)！${NC}"
+    read -p "确定要继续吗？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "已取消卸载。"
+        return 0
+    fi
+
+    info "正在停止并禁用 Usque 服务..."
+    systemctl stop usque >/dev/null 2>&1
+    systemctl disable usque >/dev/null 2>&1
+    rm -f /etc/systemd/system/usque.service
+    systemctl daemon-reload
+
+    info "正在删除核心文件与配置..."
+    rm -rf /opt/usque
+
+    info "✅ Usque 已卸载完毕。"
+}
+generate_warp_xray() {
+    info "生成基于 WireGuard 协议的 Xray WARP 出站配置..."
+    
+    # 1. 基础依赖检查
+    if ! command -v jq >/dev/null 2>&1; then
+        info "安装必要依赖 (jq)..."
+        apt-get update -yq >/dev/null 2>&1
+        apt-get install -yq jq >/dev/null 2>&1 || { err "依赖 jq 安装失败，请检查网络！"; return 1; }
+    fi
+
+    # 2. 创建独立沙盒环境
+    local temp_dir="/tmp/warp_generator_$$"
+    mkdir -p "$temp_dir"
+    cd "$temp_dir" || return 1
+    
+    # 确保在函数退出时（无论成功还是报错退出）彻底销毁沙盒，实现零残留
+    trap 'rm -rf "$temp_dir"' EXIT
+
+    # 3. 智能拉取 wgcf (调用全局高可用下载模块)
+    info "临时拉取 wgcf 工具..."
+    local arch=""
+    case $(uname -m) in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) err "不支持的系统架构: $(uname -m)"; return 1 ;;
+    esac
+
+    local wgcf_version="2.2.22"
+    local original_url="https://github.com/ViRb3/wgcf/releases/download/v${wgcf_version}/wgcf_${wgcf_version}_linux_${arch}"
+    
+    # 把原始 URL 交给轮询函数，只要成功下载就继续，失败则阻断返回
+    download_with_fallback "wgcf" "$original_url" || { err "wgcf 工具核心拉取失败，请检查网络或稍后重试！"; return 1; }
+    
+    chmod +x wgcf
+
+    # 4. 利用 wgcf 傻瓜式注册账户
+    info "委托 wgcf 向 Cloudflare 注册设备..."
+    if ! ./wgcf register --accept-tos >/dev/null 2>&1; then
+        err "WARP 账户注册失败！请确认服务器网络是否正常。"
+        return 1
+    fi
+    
+    if ! ./wgcf generate >/dev/null 2>&1; then
+        err "WARP 配置文件生成失败！"
+        return 1
+    fi
+
+    # 5. 从生成的配置中“榨取”核心数据
+    info "提取私钥与设备 ID..."
+    
+    # 从 wgcf-account.toml 提取 Client ID 和 Private Key
+    local client_id=$(grep -m 1 "device_id" wgcf-account.toml | awk -F"'" '{print $2}')
+    local private_key=$(grep -m 1 "private_key" wgcf-account.toml | awk -F"'" '{print $2}')
+    
+    # 扫描全文本，精准提取双栈 IP
+    local ipv4=$(grep "^Address" wgcf-profile.conf | grep -oE "172\.[0-9]+\.[0-9]+\.[0-9]+" | head -n 1)
+    # 增加 A-F 大写兼容，防止 CF 后期改变大小写输出格式
+    local ipv6=$(grep "^Address" wgcf-profile.conf | grep -oE "2606:[a-fA-F0-9:]+" | head -n 1)
+    
+    if [[ -z "$client_id" || -z "$private_key" || -z "$ipv4" ]]; then
+        err "配置解析失败，未能提取到完整的账户信息！"
+        return 1
+    fi
+
+    # 6. 原生计算 reserved (突破 CF 阻断的核心黑科技)
+    info "换算 reserved 防封锁特征码..."
+    local hex_client_id=$(echo -n "$client_id" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+    local r1=$((16#${hex_client_id:0:2}))
+    local r2=$((16#${hex_client_id:2:2}))
+    local r3=$((16#${hex_client_id:4:2}))
+    local reserved="[${r1}, ${r2}, ${r3}]"
+
+    # 7. 自动并发优选 Endpoint IP
+    info "自动优选最低延迟的 Endpoint IP..."
+    local cf_ips=("162.159.192.1" "162.159.193.1" "162.159.195.1" "188.114.96.3" "188.114.97.3" "188.114.98.3")
+    local best_ip="162.159.192.1"
+    local best_ping=9999
+    
+    for ip in "${cf_ips[@]}"; do
+        local avg_ping=$(ping -c 3 -W 1 "$ip" 2>/dev/null | awk -F '/' 'END {print $5}' | cut -d. -f1)
+        if [[ -n "$avg_ping" && "$avg_ping" =~ ^[0-9]+$ && "$avg_ping" -lt "$best_ping" ]]; then
+            best_ping=$avg_ping
+            best_ip=$ip
+        fi
+    done
+    info "✅ 最优 Endpoint 锁定: ${best_ip}:2408 (平均延迟: ${best_ping}ms)"
+
+    # 8. 动态精准探测 Path MTU (禁止分片撞击测试)
+    info "通过 ICMP 撞击测试探测链路极限 MTU..."
+    local test_payload=1412 # 起始载荷 (对应 MTU 1440)
+    local optimal_mtu=1440
+    local mtu_found=false
+
+    while (( test_payload >= 1200 )); do
+        if ping -c 1 -M do -s "$test_payload" -W 1 "$best_ip" >/dev/null 2>&1; then
+            optimal_mtu=$(( test_payload + 28 ))
+            mtu_found=true
+            break
+        fi
+        (( test_payload -= 10 ))
+    done
+
+    if [[ "$mtu_found" == "false" ]]; then
+        warn "⚠️ 链路 MTU 严重受限或服务器禁止 Ping 探测！启用安全回退值: 1280"
+        optimal_mtu=1280
+    else
+        info "✅ 撞击测试通过！最终计算最佳 MTU: ${optimal_mtu}"
+    fi
+
+    # 9. 自动获取 CPU 核心数
+    # local workers=$(nproc 2>/dev/null || echo 2)
+    # info "✅ 自动分配 Workers: ${workers} (基于系统 CPU 核心数)"
+
+    # 10. 拼装高规格 Xray JSON 结构
+    local address_json="\"${ipv4}/32\""
+    if [[ -n "$ipv6" ]]; then
+        # 移除 \n，直接用逗号和空格拼接，让后期的 jq 去自动美化换行
+        address_json="\"${ipv4}/32\", \"${ipv6}/128\""
+    fi
+
+    local xray_json=$(cat <<EOF
+{
+  "tag": "warp",
+  "protocol": "wireguard",
+  "settings": {
+    "secretKey": "${private_key}",
+    "address": [
+      ${address_json}
+    ],
+    "peers": [
+      {
+        "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+        "endpoint": "${best_ip}:2408"
+      }
+    ],
+    "mtu": ${optimal_mtu},
+    "reserved": ${reserved}
+  }
+}
+EOF
+)
+
+    echo -e "\n${GREEN}================================================================${NC}"
+    echo -e "${YELLOW}🎉 基于 WireGuard 协议的 Xray WARP 出站生成成功：${NC}"
+    echo -e "${GREEN}================================================================${NC}\n"
+    
+    echo "$xray_json" | jq .
+    
+    echo -e "\n${GREEN}================================================================${NC}"
+    info "💡 注意事项："
+    info "1. 该配置的 tag 已默认为 "warp"，MTU 已优化为最佳值。"
+    info "2. 在 Xray 的 routing -> rules 中，将需要解锁的域名 (如 geosite:openai, geosite:netflix) 指向 "warp"。"
+    info "3. 请勿修改 reserved 数组字段，这是防止 CloudFlare 屏蔽非官方客户端的关键。"
 }
 
 install_docker() {
@@ -1308,6 +1700,29 @@ get_status() {
     fi
 }
 
+# 组合状态检测 (支持传入多个命令名，只要命中一个即视为已安装)
+get_combined_status() {
+    for cmd in "$@"; do
+        local dir_name="${cmd%-core}" 
+        
+        # 依次检查：环境变量、标准 bin 目录、带/不带 core 的 opt 目录
+        if command -v "$cmd" >/dev/null 2>&1 || \
+           [[ -f "/usr/bin/$cmd" ]] || \
+           [[ -f "/usr/local/bin/$cmd" ]] || \
+           [[ -f "/opt/$cmd/bin/$cmd" ]] || \
+           [[ -f "/opt/$cmd/$cmd" ]] || \
+           [[ -f "/opt/$dir_name/bin/$cmd" ]] || \
+           [[ -f "/opt/$dir_name/$cmd" ]]; then
+            
+            # 只要找到一个，立刻输出绿字并中断函数返回成功
+            echo -e "${GREEN}[已安装]${NC}"
+            return 0
+        fi
+    done
+    # 如果整个循环跑完都没找到任何一个，才输出黄字未安装
+    echo -e "${YELLOW}[未安装]${NC}"
+}
+
 handle_submenu() {
     local app_name=$1
     local install_func=$2
@@ -1342,9 +1757,43 @@ handle_submenu() {
     done
 }
 
+handle_warp_submenu() {
+    while true; do
+        hash -r
+        clear
+
+        echo -e "=============================================="
+        echo -e "          🚀 WARP & Usque 组件管理"
+        echo -e "=============================================="
+        echo -e " 1. 安装/更新 CF WARP CLI     $(get_status warp-cli)"
+        echo -e " 2. 卸载 CF WARP CLI"        
+        echo -e " ---------------------------------------------"
+        echo -e " 3. 安装/更新 Usque (MASQUE)  $(get_status usque)"
+        echo -e " 4. 卸载 Usque"
+        echo -e " ---------------------------------------------"
+        echo -e " 5. 生成 Xray WireGuard 出站 JSON"
+        echo -e " ---------------------------------------------"
+        echo " 0. 返回主菜单"
+        echo -e "=============================================="
+        read -p "请输入对应的数字选项: " sub_choice
+
+        case $sub_choice in
+            1) install_warp; pause;;
+            2) uninstall_warp; pause;;
+            3) install_usque; pause;;
+            4) uninstall_usque; pause;;
+            5) generate_warp_xray; pause;;
+            0) return 0;;
+            *) echo "无效选项，请重新输入。"; sleep 1;;
+        esac
+    done
+}
+
 handle_go_submenu() {
     while true; do
+        hash -r
         clear
+
         echo -e "\n=============================================="
         echo -e "      【 GoLang 环境与编译组件管理 】"
         echo -e "=============================================="
@@ -1387,16 +1836,19 @@ handle_go_submenu() {
 
 show_main_menu() {
     while true; do
+        # 强制清空 Bash 命令路径缓存，解决状态残留问题
+        hash -r 
+        clear
         # 判断当前的持久化网络环境以供显示
         local net_status_text=""
         if [[ "$IS_CN_REGION" == "true" ]]; then
-            net_status_text="${YELLOW}中国大陆 (已启用全局加速)${NC}"
+            net_status_text="${YELLOW}中国大陆 (镜像加速)${NC}"
         else
-            net_status_text="${GREEN}海外地区 (官方直连)${NC}"
+            net_status_text="${GREEN}海外地区 (官网直连)${NC}"
         fi
 
         echo -e "=============================================="
-        echo -e "      Debian 系统调优与服务部署管理脚本"
+        echo -e "      Debian 系统调优与服务部署管理面板"
         echo -e "      网络环境: ${net_status_text}"
         echo -e "=============================================="
         echo " 1. 一键系统基础优化 (可重复执行)"
@@ -1405,7 +1857,7 @@ show_main_menu() {
         echo -e " 3. Xray Core       $(get_status xray)"
         echo -e " 4. Easytier        $(get_status easytier-core)"
         echo -e " 5. Tailscale       $(get_status tailscale)"
-        echo -e " 6. CF WARP 代理    $(get_status warp-cli)"
+        echo -e " 6. CF WARP         $(get_combined_status warp-cli usque)"
         echo -e " 7. Docker 环境     $(get_status docker)"
         echo -e " ---------------------------------------------"
         echo -e " 8. GoLang 环境     $(get_status go)"
@@ -1420,7 +1872,7 @@ show_main_menu() {
             3) handle_submenu "Xray Core" install_xray uninstall_xray;;
             4) handle_submenu "Easytier" install_easytier uninstall_easytier;;
             5) handle_submenu "Tailscale" install_tailscale uninstall_tailscale;;
-            6) handle_submenu "CF WARP" install_warp uninstall_warp;;
+            6) handle_warp_submenu;;
             7) handle_submenu "Docker & Compose" install_docker uninstall_docker;;
             8) handle_go_submenu;;
             0) echo "退出脚本，下次见 :)"; exit 0;;

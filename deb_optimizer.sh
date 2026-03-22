@@ -88,7 +88,7 @@ global_netcheck() {
 }
 
 # =========================================================
-# 高可用下载模块 (混合模式镜像池自动轮询)
+# 高可用下载模块 (混合模式镜像池自动轮询 - 2026.3 优化版)
 # =========================================================
 download_with_fallback() {
     local target_file=$1
@@ -102,15 +102,18 @@ download_with_fallback() {
         info "检测到大陆网络环境，启动镜像节点轮询下载..."
         
         # 定义混合模式镜像池 (语法规则：模式|配置参数)
-        # prefix 模式：直接在原 URL 前方追加代理域名
-        # replace 模式：格式为 replace|被替换的域名|替换后的新域名
+        # 优先级：CDN加速 (最快) > 高优全能代理站 > 教育网直连 > 备用代理 > 备用直连
         local mirrors=(
-            "prefix|https://ghfast.top"
+            "jsdelivr|"                                     # [特优] 专为 raw 文件解析至 jsdelivr CDN
+            "prefix|https://ghp.ci"                         # [极稳] 当前开发者社区公认最稳的文件代理
+            "prefix|https://ghfast.top"                     # [极速] 高速全能加速站
+            "replace|github.com|hub.nuaa.cf"                # [高速] 南航教育网镜像 (Release/源码极速)
+            "replace|raw.githubusercontent.com|raw.nuaa.cf" # [高速] 南航教育网 raw 节点
+            "replace|github.com|kkgithub.com"               # [稳定] 老牌 GitHub 网页直连镜像
             "replace|raw.githubusercontent.com|raw.kkgithub.com"
-            "replace|github.com|kkgithub.com"
-            "replace|raw.githubusercontent.com|raw.gitmirror.com"
-            "replace|github.com|hub.gitmirror.com"
-            "prefix|https://github.moeyy.xyz"
+            "prefix|https://ghproxy.net"                    # [备用] 原老牌 ghproxy 的稳定变体
+            "replace|github.com|bgithub.xyz"                # [备用] 备用直连域名
+            "prefix|https://moeyy.cn/gh-proxy"              # [备用] 个人高防优质节点
         )
         
         local success="false"
@@ -120,8 +123,23 @@ download_with_fallback() {
             local rest="${mirror_conf#*|}"
             local download_url=""
             
-            if [[ "$mode" == "prefix" ]]; then
-                # 追加模式：直接拼接
+            if [[ "$mode" == "jsdelivr" ]]; then
+                # jsdelivr 模式：利用正则提取 raw 链接的 user, repo, branch, file 并重组
+                # 仅对 raw.githubusercontent.com 生效
+                if [[ "$original_url" =~ ^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$ ]]; then
+                    local user="${BASH_REMATCH[1]}"
+                    local repo="${BASH_REMATCH[2]}"
+                    local branch="${BASH_REMATCH[3]}"
+                    local file_path="${BASH_REMATCH[4]}"
+                    # 组装全球顶级 CDN 链接 (注意：jsDelivr 有 50MB 大小限制，但对普通脚本完美)
+                    download_url="https://cdn.jsdelivr.net/gh/${user}/${repo}@${branch}/${file_path}"
+                else
+                    # 如果不是 raw 文件 (比如 Release 安装包)，则跳过此模式
+                    continue 
+                fi
+
+            elif [[ "$mode" == "prefix" ]]; then
+                # 追加模式：直接拼接，代理站会自动处理
                 download_url="${rest}/${original_url}"
                 
             elif [[ "$mode" == "replace" ]]; then
@@ -129,28 +147,30 @@ download_with_fallback() {
                 local target_domain="${rest%%|*}"
                 local replacement="${rest#*|}"
                 
-                # 使用 Bash 原生字符串替换功能：${字符串/查找/替换}
+                # Bash 原生字符串替换：${字符串/查找/替换}
                 download_url="${original_url/${target_domain}/${replacement}}"
                 
-                # 安全检查：如果原 URL 中根本不包含目标域名（即没有发生替换），则直接跳过当前镜像的测速
+                # 安全检查：如果 URL 没发生变化（说明该镜像不匹配当前域名类型），直接跳过
                 if [[ "$download_url" == "$original_url" ]]; then
                     continue
                 fi
             fi
             
             info "尝试连接镜像节点: $download_url"
-            if curl $curl_opts -o "$target_file" "$download_url"; then
+            # 捕获 HTTP 状态码，防止代理站返回 502/404 但 curl 依然当做成功的情况
+            if curl $curl_opts -o "$target_file" "$download_url" -w "%{http_code}" | grep -q "^20"; then
                 success="true"
                 info "下载成功: $target_file"
                 break
             else
-                warn "该节点响应超时或解析失败，切换下一个节点..."
-                rm -f "$target_file" # 清理可能残留的损坏文件
+                warn "该节点响应超时、解析失败或触发限制，切换下一个节点..."
+                rm -f "$target_file" # 清理可能残留的空文件或报错 HTML 页面
             fi
         done
         
         if [[ "$success" == "false" ]]; then
             err "所有国内备用镜像节点均已失效，下载彻底失败，请检查服务器网络。"
+            return 1
         fi
         
     else
@@ -159,8 +179,93 @@ download_with_fallback() {
         if ! curl $curl_opts -o "$target_file" "$original_url"; then
             rm -f "$target_file"
             err "海外节点直连下载失败，请检查目标链接是否有效: $original_url"
+            return 1
         fi
         info "下载成功: $target_file"
+    fi
+}
+
+# =========================================================
+# 高可用 Git Clone 模块 (镜像池轮询 + 防假死挂起 - 2026.3)
+# =========================================================
+git_clone_with_fallback() {
+    local target_dir=$1
+    local repo_url=$2
+    shift 2
+    local extra_args=("$@") # 接收额外参数，例如 -b v1.0 --depth 1
+
+    # 设置 Git 低速断开机制，防止镜像站半死不活导致 clone 永久挂起
+    # 连续 10 秒传输速度低于 1000 bytes/s 则自动掐断
+    export GIT_HTTP_LOW_SPEED_LIMIT=1000
+    export GIT_HTTP_LOW_SPEED_TIME=10
+    # 禁止 Git 弹窗询问密码（防止私有仓库或镜像站错误要求鉴权导致卡死）
+    export GIT_TERMINAL_PROMPT=0
+
+    if [[ "$IS_CN_REGION" == "true" ]] && [[ "$repo_url" =~ github\.com ]]; then
+        info "检测到大陆网络环境，智能配置底层网络并启动 Git 镜像轮询..."
+        
+        # 强制降级到 HTTP/1.1 并放大缓冲区，彻底解决 HTTP/2 framing layer 断流问题
+        git config --global http.version HTTP/1.1
+        git config --global http.postBuffer 524288000
+
+        # 定义 Git 专用镜像池
+        # 优先级：Git专用缓存站 > 教育网 > 高优代理 > 老牌直连
+        local mirrors=(
+            "replace|github.com|gitclone.com/github.com"  # [特优] 专为 git clone 优化的缓存站
+            "replace|github.com|hub.nuaa.cf"              # [极速] 南航教育网直连
+            "prefix|https://ghfast.top"                   # [极速] 高速全能加速站
+            "prefix|https://ghp.ci"                       # [极稳] 开发者公认高稳代理
+            "replace|github.com|kkgithub.com"             # [稳定] 老牌 GitHub 镜像
+            "replace|github.com|bgithub.xyz"              # [备用] 备用直连域名
+        )
+
+        local success="false"
+        for mirror_conf in "${mirrors[@]}"; do
+            local mode="${mirror_conf%%|*}"
+            local rest="${mirror_conf#*|}"
+            local clone_url=""
+
+            if [[ "$mode" == "prefix" ]]; then
+                clone_url="${rest}/${repo_url}"
+            elif [[ "$mode" == "replace" ]]; then
+                local target_domain="${rest%%|*}"
+                local replacement="${rest#*|}"
+                clone_url="${repo_url/${target_domain}/${replacement}}"
+            fi
+
+            info "尝试从镜像站拉取: $clone_url"
+            
+            # 清理可能残留的失败目录
+            rm -rf "$target_dir"
+            
+            # 执行克隆命令
+            if git clone "${extra_args[@]}" "$clone_url" "$target_dir"; then
+                success="true"
+                info "✅ 源码拉取成功！"
+                
+                # 恢复原仓库的 remote origin，确保后续 git pull 或更新正常对接官方
+                info "修复远程源指向官方 GitHub..."
+                git -C "$target_dir" remote set-url origin "$repo_url"
+                break
+            else
+                warn "该镜像节点连接超时或拉取失败，尝试切换下一个节点..."
+            fi
+        done
+
+        if [[ "$success" == "false" ]]; then
+            err "❌ 所有可用 Git 镜像节点均已失效，拉取失败！请检查服务器网络或稍后重试。"
+            return 1
+        fi
+
+    else
+        # 海外机器直接官方拉取
+        info "海外环境，使用官方直连拉取: $repo_url"
+        rm -rf "$target_dir"
+        if ! git clone "${extra_args[@]}" "$repo_url" "$target_dir"; then
+            err "❌ 官方直连拉取失败，请检查仓库链接有效性。"
+            return 1
+        fi
+        info "✅ 源码拉取成功！"
     fi
 }
 
@@ -1466,27 +1571,24 @@ install_derper() {
     fi
     [[ "$IS_CN_REGION" == "true" ]] && export GOPROXY=https://goproxy.cn,direct
 
+
     # 2. 智能配置 GitHub 镜像源与底层网络参数 (防 curl 16 报错)
     local repo_url="https://github.com/tailscale/tailscale.git"
-    if [[ "$IS_CN_REGION" == "true" ]]; then
-        info "国内环境拦截，自动切换至 GitHub 镜像加速源..."
-        repo_url="https://ghfast.top/https://github.com/tailscale/tailscale.git"
-        
-        # 强制降级到 HTTP/1.1 并放大缓冲区，彻底解决 HTTP/2 framing layer 断流问题
-        git config --global http.version HTTP/1.1
-        git config --global http.postBuffer 524288000
-    fi
+    local target_dir="/tmp/derp_build"
 
-    info "拉取 Tailscale $TS_VERSION 源码..."
-    rm -rf /tmp/derp_build && mkdir -p /tmp/derp_build
-    cd /tmp/derp_build
-    
-    # 加入拉取失败的拦截与提示
-    if ! git clone -b $TS_VERSION --depth 1 "$repo_url"; then
-        err "源码拉取失败！国内镜像源可能存在短暂波动，请稍后重试。"
-        return 1
+    # 强行跳到系统的 /tmp 基础目录，离开任何可能被删除的废墟目录
+    cd /tmp || exit 1
+    info "拉取 Tailscale $TS_VERSION 源码..."    
+
+    # 调用高可用克隆函数，并传入深度和分支参数
+    # 函数会自动确保父级目录存在并处理重试
+    if ! git_clone_with_fallback "$target_dir" "$repo_url" -b "$TS_VERSION" --depth 1; then
+        err "Tailscale 源码准备失败，终止安装流程。"
+        exit 1
     fi
-    cd tailscale/cmd/derper
+    
+    # 只有当克隆 100% 成功后，才安全地进入目标源码文件夹内
+    cd "$target_dir/cmd/derper" || exit 1
 
     info "执行源码魔改 (添加隐身防拨测功能)..."
 

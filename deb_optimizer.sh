@@ -1,9 +1,11 @@
 #!/bin/bash
+set -euo pipefail
 # =========================================================
 # Debian 系统性能调优与服务自动化部署面板
 # 适用系统: Debian 11 / Debian 12 (amd64)
 # 特性: 幂等性设计、防重复执行、详尽系统级注释、可选组件自动构建
 # =========================================================
+
 
 # ----------------- 颜色与日志定义 -----------------
 GREEN='\033[0;32m'
@@ -194,6 +196,12 @@ git_clone_with_fallback() {
     shift 2
     local extra_args=("$@") # 接收额外参数，例如 -b v1.0 --depth 1
 
+    # 防误删安全锁
+    if [[ -z "$target_dir" || "$target_dir" == "/" || "$target_dir" == "/usr" || "$target_dir" == "/etc" ]]; then
+        err "安全拦截：尝试操作受保护的系统目录 ($target_dir)！"
+        return 1
+    fi
+
     # 设置 Git 低速断开机制，防止镜像站半死不活导致 clone 永久挂起
     # 连续 10 秒传输速度低于 1000 bytes/s 则自动掐断
     export GIT_HTTP_LOW_SPEED_LIMIT=1000
@@ -285,42 +293,79 @@ check_ssh_security() {
     if [[ "$SSH_PORT" == "22" && "$PASS_AUTH" == "yes" ]]; then
         echo -e "${RED}严重安全漏洞警告：服务器使用 22 端口且允许密码登录，优化脚本停止运行。${NC}"
         echo -e "请先配置密钥登录、修改 SSH 端口并关闭密码登录后重试。"
-        exit 1
+        return 1
     fi
 }
 
 setup_base() {
     info "检查并优化 APT 源与基础组件..."
-    if grep -q "https://" /etc/apt/sources.list; then
-        info "APT 源已优化过 (检测到 HTTPS)，跳过替换。"
-    else
-        IS_CN=$(curl -s --connect-timeout 5 https://api.ip.sb/geoip | grep -i "China")
+
+    # 1. 安全备份 (防呆保护：只在没有备份时备份)
+    if [[ ! -f /etc/apt/sources.list.bak ]]; then
         cp /etc/apt/sources.list /etc/apt/sources.list.bak
-        if [[ -n "$IS_CN" ]]; then
-            info "切换至清华大学 TUNA 镜像源 (HTTPS)..."
-            sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
-            sed -i 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
-        fi
-        sed -i 's|http://|https://|g' /etc/apt/sources.list
     fi
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -yq && apt-get install -yq ca-certificates curl wget gnupg lsb-release procps unzip tar openssl git
+
+    # 2. 预先安装证书 (破除“鸡生蛋”死锁)
+    if ! dpkg -s ca-certificates >/dev/null 2>&1; then
+        info "正在预装 CA 证书以支持 HTTPS 源..."
+        apt-get update -yq >/dev/null 2>&1
+        apt-get install -yq ca-certificates >/dev/null 2>&1
+    fi
+
+    # 3. 国内环境判断与精准镜像替换
+    if [[ "$IS_CN_REGION" == "true" ]]; then
+        # 只要源里有官方源，统统替换
+        if grep -qE "deb\.debian\.org|security\.debian\.org" /etc/apt/sources.list; then
+            info "检测到国内环境且正在使用官方源，正在切换至清华大学 TUNA 镜像源..."
+            sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+            sed -i 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+        else
+            info "国内环境：检测到已配置为第三方镜像源，跳过替换。"
+        fi
+    else
+        info "海外环境：保留默认官方源。"
+    fi
+
+    # 4. 全局强制 HTTPS 升级
+    if grep -q "http://" /etc/apt/sources.list; then
+        info "正在将 APT 源强制升级为更安全的 HTTPS 协议..."
+        sed -i 's|http://|https://|g' /etc/apt/sources.list
+    fi
+
+    # 5. 正式更新与安装基础组件
+    info "正在更新包缓存并安装基础组件..."
+    apt-get update -yq || warn "APT 更新出现异常，请检查网络或源配置。"
+    apt-get install -yq curl wget gnupg lsb-release procps unzip tar openssl git ca-certificates
     apt-get upgrade -yq && apt-get autoremove -yq
 }
 
 setup_kernel() {
     info "检查系统内核..."
     CURRENT_KERNEL=$(uname -r)
+    
     # Cloud 内核针对 KVM/Xen 等虚拟化环境精简了不必要的物理硬件驱动，体积更小，网络性能更好
     if echo "$CURRENT_KERNEL" | grep -q "cloud"; then
-        info "当前内核 ($CURRENT_KERNEL) 已是 cloud 版本，跳过。"
+        info "当前内核 ($CURRENT_KERNEL) 已是 cloud 版本，跳过更换。"
     else
-        warn "准备安装 linux-image-cloud-amd64..."
-        apt-get install -yq linux-image-cloud-amd64 linux-headers-cloud-amd64 || die "安装 cloud 内核失败"
-        update-grub
-        OLD_KERNELS=$(dpkg -l | grep linux-image | awk '{print $2}' | grep -v "cloud" | grep -v "$CURRENT_KERNEL")
-        if [[ -n "$OLD_KERNELS" ]]; then apt-get purge -yq $OLD_KERNELS; fi
+        echo -e "${YELLOW}检测到当前内核 ($CURRENT_KERNEL) 不是针对虚拟化环境优化的 cloud 版本。${NC}"
+        read -p "是否更换为 cloud 内核？(降低资源占用但减少硬件兼容，需重启生效) [y/N 默认: N]: " choice
+        
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            warn "准备安装 linux-image-cloud-amd64..."
+            apt-get install -yq linux-image-cloud-amd64 linux-headers-cloud-amd64 || die "安装 cloud 内核失败"
+            update-grub
+            
+            # 清理旧内核
+            OLD_KERNELS=$(dpkg -l | grep linux-image | awk '{print $2}' | grep -v "cloud" | grep -v "$CURRENT_KERNEL" || true)
+            if [[ -n "$OLD_KERNELS" ]]; then 
+                apt-get purge -yq $OLD_KERNELS
+            fi
+            info "Cloud 内核安装与清理完成。"
+        else
+            info "已跳过更换 cloud 内核。"
+        fi
     fi
 }
 
@@ -420,9 +465,20 @@ EOF
 setup_security() {
     info "检查 Fail2ban 和 UFW 配置..."
     apt-get install -yq fail2ban ufw > /dev/null
-    SSH_PORT=$(ss -tlpn | grep -w sshd | awk '{print $4}' | rev | cut -d: -f1 | rev | head -n1)
-    if [[ -z "$SSH_PORT" ]]; then SSH_PORT=22; fi
 
+    # 1. 抓取“当前正在维持会话”的真实连接端口 (旧端口)
+    local CURRENT_SSH_PORT=""
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        CURRENT_SSH_PORT=$(echo "$SSH_CONNECTION" | awk '{print $4}')
+    fi
+    
+    # 2. 抓取“系统配置中实际要监听”的未来端口 (新端口)
+    # 优先使用 sshd -T 直接解析配置文件，比用 ss 抓取网络状态更安全（即使服务没启动也能取到）
+    local LISTEN_PORT=$(sshd -T 2>/dev/null | awk '/^port / {print $2}' | head -n 1 || true)
+    
+    # 终极兜底：如果配置文件极其畸形导致没取到，回退到默认 22
+    LISTEN_PORT=${LISTEN_PORT:-22}
+    
     if [[ -f "/etc/fail2ban/jail.local" ]] && grep -q "port = $SSH_PORT" /etc/fail2ban/jail.local; then
         info "Fail2ban 已经为当前 SSH 端口配置防护，跳过。"
     else
@@ -444,44 +500,80 @@ EOF
         systemctl enable fail2ban
     fi
 
+    # 3. UFW 防火墙双保险放行逻辑
+    info "配置 UFW 防火墙基础规则..."
+    ufw --force reset >/dev/null 2>&1
     ufw default deny incoming >/dev/null 2>&1
     ufw default allow outgoing >/dev/null 2>&1
-    ufw allow ${SSH_PORT}/tcp comment 'SSH Port' >/dev/null 2>&1
+
+    # 必须放行未来的监听端口
+    info "放行 sshd 配置监听端口: $LISTEN_PORT"
+    ufw allow "${LISTEN_PORT}/tcp" comment 'SSH Listen Port' >/dev/null 2>&1
+
+    # 如果当前会话端口与监听端口不同，进行过渡期保护
+    if [[ -n "$CURRENT_SSH_PORT" && "$CURRENT_SSH_PORT" != "$LISTEN_PORT" ]]; then
+        warn "检测到当前会话端口 ($CURRENT_SSH_PORT) 与 sshd 配置端口 ($LISTEN_PORT) 不一致！"
+        info "为防止防火墙启动瞬间截断当前会话，已临时双向放行。"
+        ufw allow "${CURRENT_SSH_PORT}/tcp" comment 'SSH Active Session (Legacy)' >/dev/null 2>&1
+    fi
 }
 
 setup_memory() {
-    info "检查 ZRAM 与 Swap 文件..."
+    info "检查内存优化与虚拟内存配置..."
     PHY_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     PHY_MEM_MB=$((PHY_MEM_KB / 1024))
     
-    # 配置 ZRAM (内存压缩技术，提升小内存机器的可用内存)
-    if grep -q "PERCENT=50" /etc/default/zramswap 2>/dev/null; then
-        info "ZRAM 已经配置，跳过。"
-    else
-        apt-get install -yq zram-tools > /dev/null
-        cat > /etc/default/zramswap << EOF
+    # ==========================================
+    # 1. ZRAM 交互式配置
+    # ==========================================
+    read -p "是否需要配置 ZRAM 内存压缩？(用 CPU 算力换取更大可用内存) [y/N 默认N]: " zram_choice
+    if [[ "$zram_choice" =~ ^[Yy]$ ]]; then
+        if grep -q "PERCENT=50" /etc/default/zramswap 2>/dev/null; then
+            info "ZRAM 已经配置，跳过。"
+        else
+            info "正在配置 ZRAM..."
+            apt-get install -yq zram-tools > /dev/null
+            cat > /etc/default/zramswap << EOF
 # ZRAM 配置: 使用高压缩比的 zstd 算法，占用最多 50% 的物理内存
 ALGO=zstd
 PERCENT=50
 PRIORITY=100
 EOF
-        systemctl restart zramswap
+            systemctl restart zramswap
+            info "ZRAM 配置已生效。"
+        fi
+    else
+        info "已跳过 ZRAM 内存压缩配置。"
     fi
     
-    # 配置传统 Swap 文件作为最终的物理内存后备 (防止 OOM)
-    SWAP_SIZE_MB=$((PHY_MEM_MB * 2))
-    if grep -q "/swapfile" /proc/swaps; then
-        info "Swap 内存已挂载，跳过创建。"
-    elif [[ -f /swapfile ]]; then
-        info "Swap 文件已存在但未挂载，尝试重新挂载..."
-        mkswap /swapfile && swapon /swapfile
+    # ==========================================
+    # 2. Swap 文件交互式配置
+    # ==========================================
+    read -p "是否需要配置传统 Swap 交换文件？(作为物理内存耗尽时的补充) [y/N 默认N]: " swap_choice
+    if [[ "$swap_choice" =~ ^[Yy]$ ]]; then
+        SWAP_SIZE_MB=$((PHY_MEM_MB * 2))
+        if grep -q "/swapfile" /proc/swaps; then
+            info "Swap 内存已挂载，跳过创建。"
+        elif [[ -f /swapfile ]]; then
+            info "Swap 文件已存在但未挂载，尝试重新挂载..."
+            mkswap /swapfile && swapon /swapfile
+            info "Swap 文件已重新挂载。"
+        else
+            info "正在创建 Swap 文件 (${SWAP_SIZE_MB}MB)..."
+            # 优先使用 fallocate 极速分配空间，不支持时回退使用 dd
+            fallocate -l ${SWAP_SIZE_MB}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=${SWAP_SIZE_MB} status=progress
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            
+            # 持久化写入 fstab
+            if ! grep -q "/swapfile" /etc/fstab; then 
+                echo "/swapfile none swap sw 0 0" >> /etc/fstab
+            fi
+            info "Swap 文件创建并挂载成功。"
+        fi
     else
-        info "创建 Swap 文件 (${SWAP_SIZE_MB}MB)..."
-        fallocate -l ${SWAP_SIZE_MB}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=${SWAP_SIZE_MB} status=progress
-        chmod 600 /swapfile
-        mkswap /swapfile
-        swapon /swapfile
-        if ! grep -q "/swapfile" /etc/fstab; then echo "/swapfile none swap sw 0 0" >> /etc/fstab; fi
+        info "已跳过 Swap 交换文件配置。"
     fi
 }
 
@@ -567,7 +659,7 @@ net.ipv6.conf.default.forwarding = 1
 #net.ipv4.conf.all.route_localnet = 1
 EOF
         sysctl --system > /dev/null 2>&1
-        info "IP 转发已成功开启。"
+        info "IP 转发已成功开启。"#
     fi
     sleep 2
 }
@@ -961,7 +1053,7 @@ install_usque() {
     local release_json=$(curl -sSL --connect-timeout 10 "$api_url")
     
     # 巧妙利用 jq 的 select 语法，不再硬编码版本号，永远锁定最新的 linux_架构.zip
-    local dl_url=$(echo "$release_json" | jq -r ".assets[] | select(.name | contains(\"linux_${arch}.zip\")) | .browser_download_url 2>/dev/null")
+    local dl_url=$(echo "$release_json" | jq -r ".assets[] | select(.name | contains(\"linux_${arch}.zip\")) | .browser_download_url" 2>/dev/null)
 
     if [[ -z "$dl_url" || "$dl_url" == "null" ]]; then
         err "获取 Usque 下载链接失败！可能遇到了 GitHub API 限流，请稍后再试。"
@@ -994,7 +1086,9 @@ install_usque() {
         echo -e "${GREEN}Usque 支持通过 Zero Trust 的 JWT Token 直接生成 MASQUE 高级配置。${NC}"
         echo -e "您可以在浏览器登录 Cloudflare Zero Trust 抓取 Token (通常以 eyJ 开头)。"
         echo -e "${YELLOW}================================================================${NC}"
-        read -p "请输入您的完整 JWT Token (或直接按回车跳过自动注册): " jwt_token
+        echo -e "请输入您的完整 JWT Token (按回车可跳过本步，直接自动注册): "
+        read -s jwt_token
+        echo ""
 
         if [[ -n "$jwt_token" ]]; then
             info "正在向 Cloudflare 注册设备，请稍候..."
@@ -1051,7 +1145,7 @@ uninstall_usque() {
     fi
 
     echo -e "\n${YELLOW}警告: 此操作将彻底删除 Usque 及其所有配置文件 (包括 config.json 中的私钥)！${NC}"
-    read -p "确定要继续吗？[y/N]: " confirm
+    read -p "确定要继续吗？[y/N 默认: N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         info "已取消卸载。"
         return 0
@@ -1574,21 +1668,29 @@ install_derper() {
 
     # 2. 智能配置 GitHub 镜像源与底层网络参数 (防 curl 16 报错)
     local repo_url="https://github.com/tailscale/tailscale.git"
-    local target_dir="/tmp/derp_build"
+    # 强行跳到系统的 /tmp 基础目录，使用 return 防止面板闪退
+    local build_sandbox="/tmp/derp_build_$$"
+    mkdir -p "$build_sandbox"
+    
+    # 使用 subshell () 执行或者在函数末尾显式切回原目录
+    # 最优雅的方式是记录当前路径，结束后跳回：
+    local original_dir=$(pwd)
+    cd "$build_sandbox" || return 1
+    
+    # 使用 trap 保证哪怕中间报错 return 1 退出，也会执行环境复原
+    trap 'cd "$original_dir"; rm -rf "$build_sandbox"' RETURN
 
-    # 强行跳到系统的 /tmp 基础目录，离开任何可能被删除的废墟目录
-    cd /tmp || exit 1
     info "拉取 Tailscale $TS_VERSION 源码..."    
 
     # 调用高可用克隆函数，并传入深度和分支参数
     # 函数会自动确保父级目录存在并处理重试
-    if ! git_clone_with_fallback "$target_dir" "$repo_url" -b "$TS_VERSION" --depth 1; then
+    if ! git_clone_with_fallback "$build_sandbox/tailscale" "$repo_url" -b "$TS_VERSION" --depth 1; then
         err "Tailscale 源码准备失败，终止安装流程。"
-        exit 1
+        return 1
     fi
     
     # 只有当克隆 100% 成功后，才安全地进入目标源码文件夹内
-    cd "$target_dir/cmd/derper" || exit 1
+    cd "$build_sandbox/tailscale/cmd/derper" || return 1
 
     info "执行源码魔改 (添加隐身防拨测功能)..."
 
@@ -1659,7 +1761,7 @@ func closeConn(w http.ResponseWriter) {\
     done
 
     # 通过本地网卡直接获取公网 IPv6 (排除 Tailscale 虚拟内网及本地链路地址)
-    local server_ipv6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | grep -v -E "^(fd|fc)" | head -n 1)
+    local server_ipv6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | grep -v -E "^(fd|fc)" | head -n 1 || true)
 
     if [[ -z "$server_ipv4" ]]; then
         warn "未能自动检测到公网 IPv4，将回退到 127.0.0.1，请随后手动修改证书和配置！"
@@ -1999,7 +2101,7 @@ if [[ "$BASE_OPTIMIZED" != "true" ]]; then
     echo -e "${GREEN}======================================================${NC}"
     echo -e "${GREEN}初次基础系统优化全部完成！(默认已关闭 IP 转发)${NC}"
     echo -e "如果后续你需要搭建代理/组网，请在菜单中按 7 开启 IP 转发。"
-    echo -e "请务必手动执行: ${YELLOW}ufw status${NC} 确认放行端口后执行 ${YELLOW}ufw enable${NC}"
+    echo -e "请务必手动执行: ${YELLOW}ufw show added${NC} 确认放行端口无误，再执行 ${YELLOW}ufw enable${NC}"
     echo -e "${GREEN}======================================================${NC}"
     echo -e "即将进入管理面板..."
     sleep 4

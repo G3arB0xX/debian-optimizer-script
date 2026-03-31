@@ -32,6 +32,10 @@ if [[ -f "$INIT_FLAG" ]]; then
     source "$INIT_FLAG"
 fi
 
+# 防止首次运行时触发 set -u 的 unbound variable
+IS_CN_REGION="${IS_CN_REGION:-}"
+BASE_OPTIMIZED="${BASE_OPTIMIZED:-}"
+
 # 全局注入 Go 环境变量，确保检测函数能找到 go 和 xcaddy
 export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
 
@@ -44,7 +48,7 @@ fi
 # =========================================================
 global_netcheck() {
     # 幂等检测：如果已经从配置文件加载了地区，则直接跳过耗时的网络探测
-    if [[ -n "$IS_CN_REGION" ]]; then
+    if [[ -n "{{$IS_CN_REGION:-}}" ]]; then
         return
     fi
 
@@ -479,7 +483,7 @@ setup_security() {
     # 终极兜底：如果配置文件极其畸形导致没取到，回退到默认 22
     LISTEN_PORT=${LISTEN_PORT:-22}
     
-    if [[ -f "/etc/fail2ban/jail.local" ]] && grep -q "port = $SSH_PORT" /etc/fail2ban/jail.local; then
+    if [[ -f "/etc/fail2ban/jail.local" ]] && grep -q "port = $LISTEN_PORT" /etc/fail2ban/jail.local; then
         info "Fail2ban 已经为当前 SSH 端口配置防护，跳过。"
     else
         cat > /etc/fail2ban/jail.local << EOF
@@ -1928,12 +1932,11 @@ get_combined_status() {
 }
 
 handle_submenu() {
-    local app_name=$1
-    local install_func=$2
-    local uninstall_func=$3
-    # 新增：接收可选的第3个自定义菜单名和函数
-    local extra_name=$4
-    local extra_func=$5
+    local app_name=${1:-}
+    local install_func=${2:-}
+    local uninstall_func=${3:-}
+    local extra_name=${4:-}
+    local extra_func=${5:-}
     
     while true; do
         echo -e "\n--- 【 $app_name 管理 】 ---"
@@ -2053,7 +2056,7 @@ show_main_menu() {
 
         echo -e "=============================================="
         echo -e "      Debian 系统调优与服务部署管理面板"
-        echo -e "      网络环境: ${net_status_text}"
+        echo -e "        网络环境: ${net_status_text}"
         echo -e "=============================================="
         echo " 1. 一键系统基础优化 (可重复执行)"
         echo -e " 2. 切换 IP 转发状态 当前: $(get_ip_forward_status)"

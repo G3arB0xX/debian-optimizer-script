@@ -1804,9 +1804,9 @@ func closeConn(w http.ResponseWriter) {\
     sed -i 's/io.WriteString(w, "DERP\\n")/closeConn(w)/g' derper.go
 
     # --- 魔改 4: 严格校验核心握手路径 /derp (无 Upgrade 头直接阻断) ---
-    # 双通道匹配：同样兼容 derphttp 和 derpserver 的 Handler 包装
-    sed -i 's/mux.Handle("\/derp", derphttp.Handler(s))/mux.HandleFunc("\/derp", func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get("Upgrade") != "derp" {\n\t\t\tcloseConn(w)\n\t\t\treturn\n\t\t}\n\t\tderphttp.Handler(s).ServeHTTP(w, r)\n\t})/g' derper.go
-    sed -i 's/mux.Handle("\/derp", derpserver.Handler(s))/mux.HandleFunc("\/derp", func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get("Upgrade") != "derp" {\n\t\t\tcloseConn(w)\n\t\t\treturn\n\t\t}\n\t\tderpserver.Handler(s).ServeHTTP(w, r)\n\t})/g' derper.go
+    # 双通道匹配：同样兼容 derphttp 和 derpserver 的 Handler 包装，并避免大小写导致的误封锁
+    sed -i 's/mux.Handle("\/derp", derphttp.Handler(s))/mux.HandleFunc("\/derp", func(w http.ResponseWriter, r *http.Request) {\n\t\tup := r.Header.Get("Upgrade")\n\t\tif up != "derp" \&\& up != "DERP" {\n\t\t\tcloseConn(w)\n\t\t\treturn\n\t\t}\n\t\tderphttp.Handler(s).ServeHTTP(w, r)\n\t})/g' derper.go
+    sed -i 's/mux.Handle("\/derp", derpserver.Handler(s))/mux.HandleFunc("\/derp", func(w http.ResponseWriter, r *http.Request) {\n\t\tup := r.Header.Get("Upgrade")\n\t\tif up != "derp" \&\& up != "DERP" {\n\t\t\tcloseConn(w)\n\t\t\treturn\n\t\t}\n\t\tderpserver.Handler(s).ServeHTTP(w, r)\n\t})/g' derper.go
     
     # 防漏校验机制
     # 如果未来官方大改了源码导致 sed 替换失败，这里会立刻拦截，防止编译出裸奔节点

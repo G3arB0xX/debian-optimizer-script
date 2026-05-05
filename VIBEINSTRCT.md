@@ -36,6 +36,9 @@
 - 模块复用：各种功能拆分为简单的函数，使用时调用，不重复造轮子。
 - 详细报错：脚本运行失败后必须有详细报错以及修复指导。如果脚本运行权限不够，应在不关闭脚本的情况下指导用户智能提权。
 - 详尽注释：详细注释重要代码与抽象流程，增加代码可读性，提高可维护性。
+- **Systemd 安全沙盒化 (Sandboxing)**：所有服务单元必须包含 `ProtectSystem=full`, `PrivateTmp=true`, `NoNewPrivileges=true`。对于第三方服务，使用 `.service.d` 目录进行 override 注入。
+- **最小权限运行 (Privilege Minimization)**：严禁无理由以 root 运行业务服务。对于需要绑定低位端口的非 root 服务，使用 `AmbientCapabilities=CAP_NET_BIND_SERVICE`。
+- **防御性 Shell 编程**：所有变量必须被双引号包裹，所有外部调用必须有超时控制与错误捕获。
 
 ### 2.3 代码版本管理
 
@@ -61,6 +64,7 @@
 * **包管理器与基础依赖**：智能替换镜像源，强制升级 APT HTTPS 传输，自动补齐基础系统组件。
 * **内核与网络协议栈 (Sysctl)**：自动检测并提示更换 Cloud 专用精简内核；通过写入 `.d` 独立配置文件优化网络并发。
 * **内存与日志控制**：提供 ZRAM（zstd 算法压缩）与 Swap 交换文件的交互式配置；重写 Logrotate 规则，实现系统日志按天压缩轮转，防磁盘爆满。
+* **内存极限瘦身 (Extreme Slimming)**：针对低配 VPS 强制削减多余 TTY 终端（保留 2 个），移除冗余日志系统 (rsyslog)，严格限制 Journald 配额，并支持交互式屏蔽 ModemManager/Avahi 等冗余服务。
 * **基础安全加固 (SSH Hardening)**：
     *   **非 Root 用户管控**：自动检测并引导创建具备 sudo 权限的普通用户，强制脱离 root 直接登录。
     *   **密钥强制验证**：强制配置 Ed25519 密钥登录，本地生成密钥对，云端自动化注入。

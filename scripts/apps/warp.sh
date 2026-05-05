@@ -10,8 +10,7 @@ install_warp() {
 
     info "正在配置 Cloudflare 官方 APT 通道..."
     # 补齐 LSB 依赖以便精准获取 Debian 代号 (如 bullseye/bookworm)
-    apt-get update -yq >/dev/null 2>&1
-    apt-get install -yq lsb-release gnupg || return 1
+    safe_apt_install lsb-release gnupg || return 1
     
     # 导入 GPG 密钥
     curl -fsSL --connect-timeout 5 https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || return 1
@@ -21,7 +20,7 @@ install_warp() {
     
     info "拉取最新 WARP 客户端并执行部署..."
     apt-get update -yq >/dev/null 2>&1
-    apt-get install -yq cloudflare-warp || return 1
+    safe_apt_install cloudflare-warp || return 1
     
     # 激活并等待守护进程初始化
     systemctl enable --now warp-svc >/dev/null 2>&1
@@ -47,9 +46,7 @@ install_warp() {
     fi
 
     # --- 系统级性能加固 (Systemd Override) ---
-    info "正在注入内核级性能锁与内存限制..."
-    mkdir -p /etc/systemd/system/warp-svc.service.d
-    cat > /etc/systemd/system/warp-svc.service.d/override.conf << EOF
+    inject_service_override "warp-svc" << EOF
 [Service]
 # 设置内存软上限，触发 GC 回收 (80M)
 MemoryHigh=80M
@@ -57,9 +54,15 @@ MemoryHigh=80M
 MemoryMax=120M
 # 屏蔽高频调试日志，仅保留 Error 级输出以保护磁盘寿命
 LogLevelMax=error
+
+# --- Security Sandboxing ---
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# WARP 守护进程通常需要 root 权限和较多能力，这里暂不限制 CapabilityBoundingSet 以防断网
+# ---------------------------
 EOF
-    systemctl daemon-reload
-    systemctl restart warp-svc
     
     info "✅ Cloudflare WARP 部署完成！"
     info "本地 Socks5 入口: 127.0.0.1:40000"
@@ -80,8 +83,7 @@ uninstall_warp() {
 # ----------------- Usque (MASQUE) -----------------
 install_usque() {
     info "正在部署 Usque (MASQUE 协议) 高速客户端..."
-    apt-get update -yq >/dev/null 2>&1
-    apt-get install -yq jq unzip || return 1
+    safe_apt_install jq unzip || return 1
     
     local arch=""
     [[ "$(uname -m)" == "x86_64" ]] && arch="amd64" || arch="arm64"
@@ -98,25 +100,35 @@ install_usque() {
     unzip -qo "$tmp_zip" -d /opt/usque/
     chmod +x /opt/usque/usque
     
+    # 初始化标准运行用户
+    create_system_user "usque"
+    chown -R usque:usque /opt/usque
+
     # 部署 Systemd 服务
-    cat > /etc/systemd/system/usque.service << EOF
+    deploy_systemd_service "usque" << EOF
 [Unit]
 Description=Usque MASQUE Socks5 Service
 After=network.target
 
 [Service]
 Type=simple
-User=root
+User=usque
+Group=usque
 WorkingDirectory=/opt/usque
 ExecStart=/opt/usque/usque socks -b 127.0.0.1 -p 40001
 Restart=on-failure
 RestartSec=5
 
+# --- Security Sandboxing ---
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# ---------------------------
+
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now usque
     
     info "✅ Usque 部署完成，代理端口: 40001"
 }
@@ -127,6 +139,7 @@ uninstall_usque() {
     systemctl disable usque >/dev/null 2>&1
     rm -f /etc/systemd/system/usque.service
     rm -rf /opt/usque
+    id -u usque >/dev/null 2>&1 && userdel usque
     info "✅ Usque 已移除。"
 }
 

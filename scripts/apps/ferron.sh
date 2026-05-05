@@ -8,9 +8,7 @@ install_ferron() {
     info "正在通过 Ferron 官方标准仓库部署 Web 服务器..."
 
     # 1. 补齐仓库管理依赖
-    info "正在安装必要的仓库管理组件..."
-    apt-get update -yq >/dev/null 2>&1
-    apt-get install -yq curl gnupg2 ca-certificates lsb-release debian-archive-keyring >/dev/null 2>&1
+    safe_apt_install curl gnupg2 ca-certificates lsb-release debian-archive-keyring || return 1
 
     # 2. 注入官方签名密钥 (采用现代 keyring 隔离模式)
     info "正在添加 Ferron 官方 PGP 签名密钥..."
@@ -29,21 +27,26 @@ install_ferron() {
     # 4. 执行安装
     info "同步包缓存并安装 Ferron..."
     apt-get update -yq >/dev/null 2>&1
-    apt-get install -yq ferron || {
+    safe_apt_install ferron || {
         err "Ferron 软件包安装失败。可能是不支持当前系统发行版 ($codename)。"
         return 1
     }
 
     # 5. 基础环境初始化
-    # 官方包默认 Web 根目录为 /var/www/ferron，配置文件为 /etc/ferron.kdl
     if [[ ! -d "/var/www/ferron" ]]; then
         mkdir -p /var/www/ferron
         echo "<h1>Ferron is installed successfully!</h1>" > /var/www/ferron/index.html
         chown -R ferron:ferron /var/www/ferron
     fi
 
-    # 激活并启动服务
-    systemctl enable --now ferron
+    # --- 安全沙箱加固 (Systemd Override) ---
+    inject_service_override "ferron" << EOF
+[Service]
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+EOF
 
     if systemctl is-active --quiet ferron; then
         info "✅ Ferron 已通过官方仓库成功安装并运行。"
@@ -74,7 +77,7 @@ uninstall_ferron() {
     apt-get update -yq >/dev/null 2>&1
 
     # 4. 暴力清理目录残留
-    rm -rf /etc/ferron.kdl /var/log/ferron /var/www/ferron
+    rm -rf /etc/ferron.kdl /var/log/ferron /var/www/ferron /etc/systemd/system/ferron.service.d
     
     info "✅ Ferron 官方组件及仓库配置已彻底移除。"
 }

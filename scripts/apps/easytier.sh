@@ -29,6 +29,17 @@ install_easytier() {
         bash /tmp/easytier-install.sh install $proxy_args || return 1
     fi
     
+    # --- 安全沙箱加固 (Systemd Override) ---
+    inject_service_override "easytier@" << EOF
+[Service]
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# Easytier 需要网卡管理能力
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+EOF
+    
     # 防火墙 P2P 端口自动放行 (nftables)
     # 默认使用 11010 - 11015 范围以支持多实例并发打洞
     add_fw_rule "11010-11015" "tcp/udp" "Easytier_P2P"
@@ -50,6 +61,7 @@ uninstall_easytier() {
     systemctl stop easytier >/dev/null 2>&1
     systemctl disable easytier >/dev/null 2>&1
     rm -rf /etc/systemd/system/easytier*
+    rm -rf /etc/systemd/system/easytier@.service.d
     systemctl daemon-reload
     
     # 彻底抹除二进制与安装目录

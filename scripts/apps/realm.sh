@@ -38,9 +38,7 @@ install_realm() {
     rm -f "$tmp_file"
 
     # 4. 创建运行用户与配置目录
-    if ! id -u realm >/dev/null 2>&1; then
-        useradd -r -s /usr/sbin/nologin realm
-    fi
+    create_system_user "realm"
     
     mkdir -p /etc/realm
     if [[ ! -f /etc/realm/config.toml ]]; then
@@ -56,7 +54,7 @@ EOF
     fi
 
     # 5. 配置 Systemd 服务
-    cat > /etc/systemd/system/realm.service << EOF
+    deploy_systemd_service "realm" << EOF
 [Unit]
 Description=Realm Relay Service
 After=network.target
@@ -71,14 +69,18 @@ Restart=always
 RestartSec=5
 LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Security Sandboxing ---
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# ---------------------------
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable realm
-    systemctl restart realm
 
     if systemctl is-active --quiet realm; then
         info "✅ Realm 已成功安装并启动。"

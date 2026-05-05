@@ -108,8 +108,8 @@ root soft nofile 1048576
 root hard nofile 1048576
 EOF
     # 同时同步 Systemd 的全局限制，确保通过 systemctl 启动的服务也受惠
-    sed -i 's/#DefaultLimitNOFILE=.*/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf
-    sed -i 's/#DefaultLimitNOFILE=.*/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf
+    set_conf_value "/etc/systemd/system.conf" "DefaultLimitNOFILE" "1048576"
+    set_conf_value "/etc/systemd/user.conf" "DefaultLimitNOFILE" "1048576"
     info "✅ 文件句柄限制已解除 (需重新登录生效)。"
 }
 
@@ -158,10 +158,56 @@ EOF
 setup_logrotate() {
     info "配置 Logrotate 日志按天轮转，防止磁盘撑爆..."
     # 强制将每周轮换改为每日，保留 7 天副本并开启压缩
-    sed -i 's/weekly/daily/g' /etc/logrotate.conf
-    sed -i 's/rotate 4/rotate 7/g' /etc/logrotate.conf
-    sed -i 's/#compress/compress/g' /etc/logrotate.conf
+    set_conf_value "/etc/logrotate.conf" "daily" "" ""
+    set_conf_value "/etc/logrotate.conf" "rotate" "7"
+    set_conf_value "/etc/logrotate.conf" "compress" "" ""
     info "✅ 日志轮转配置更新。"
+}
+
+# ----------------- 内存极限瘦身 (Low Memory Optimization) -----------------
+# 针对 1G 及以下内存 VPS 的深度优化，削减冗余进程与日志开销
+setup_low_memory_optimization() {
+    info "正在执行系统级极限瘦身优化 (针对低配 VPS)..."
+
+    # 1. 削减 TTY 终端数量 (保留 2 个以防万一)
+    info "削减冗余 TTY 终端进程..."
+    if [[ -f /etc/systemd/logind.conf ]]; then
+        set_conf_value "/etc/systemd/logind.conf" "NAutoVTs" "2"
+        set_conf_value "/etc/systemd/logind.conf" "ReserveVT" "2"
+        systemctl restart systemd-logind >/dev/null 2>&1 || true
+    fi
+
+    # 2. 移除重复的日志系统 (rsyslog)
+    if dpkg -s rsyslog >/dev/null 2>&1; then
+        info "检测到 rsyslog，正在卸载以释放内存 (改由 journald 接管)..."
+        apt-get purge -yq rsyslog >/dev/null 2>&1
+    fi
+
+    # 3. 限制 Systemd Journal 日志的体量
+    info "限制 Journald 日志内存与磁盘配额..."
+    local journal_conf="/etc/systemd/journald.conf"
+    if [[ -f "$journal_conf" ]]; then
+        set_conf_value "$journal_conf" "SystemMaxUse" "200M"
+        set_conf_value "$journal_conf" "RuntimeMaxUse" "10M"
+        systemctl restart systemd-journald >/dev/null 2>&1 || true
+    fi
+
+    # 4. 裁剪系统冗余服务 (可选)
+    echo -e "${YELLOW}是否屏蔽系统冗余服务 (ModemManager, Avahi, Bluetooth 等)？[y/N]: ${NC}"
+    read -p "" service_choice
+    if [[ "$service_choice" =~ ^[Yy]$ ]]; then
+        info "正在屏蔽冗余服务..."
+        local services=("ModemManager" "avahi-daemon" "bluetooth" "cups" "pnmos")
+        for svc in "${services[@]}"; do
+            if systemctl list-unit-files | grep -q "^${svc}.service"; then
+                systemctl stop "$svc" >/dev/null 2>&1 || true
+                systemctl mask "$svc" >/dev/null 2>&1 || true
+                info "已屏蔽服务: $svc"
+            fi
+        done
+    fi
+
+    info "✅ 极限瘦身优化已完成。"
 }
 
 # ----------------- 时区与时间同步 -----------------
@@ -184,6 +230,7 @@ run_base_optimization() {
     setup_limits
     setup_security # 由 security.sh 提供
     setup_memory
+    setup_low_memory_optimization
     setup_logrotate
     setup_timezone
     

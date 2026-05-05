@@ -24,6 +24,16 @@ install_tailscale() {
         return 1
     }
     
+    # --- 安全沙箱加固 (Systemd Override) ---
+    inject_service_override "tailscaled" << EOF
+[Service]
+ProtectSystem=full
+# Tailscale 需要在 /root/.config 或其他地方保存状态，暂不开启 ProtectHome
+PrivateTmp=true
+NoNewPrivileges=true
+# Tailscale 需要极高的权限来管理网络
+EOF
+    
     # 自动在防火墙放行 P2P 打洞所需的 UDP 端口 (默认 41641)
     add_fw_rule "41641" "udp" "Tailscale_P2P"
     

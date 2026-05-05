@@ -10,11 +10,22 @@ install_xray() {
     # 获取官方安装脚本，利用 fallback 机制保障国内成功率
     download_with_fallback "/tmp/xray-install.sh" "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh" || return 1
     
-    # 执行官方安装命令，强制使用 root 运行以管理系统资源
-    bash /tmp/xray-install.sh install -u root || { err "Xray 核心安装失败。"; return 1; }
+    # 执行官方安装命令
+    bash /tmp/xray-install.sh install || { err "Xray 核心安装失败。"; return 1; }
     
     # 部署第三方增强版路由规则 (GeoData)
     setup_xray_geodata || true
+
+    # --- 安全沙箱加固 (Systemd Override) ---
+    inject_service_override "xray" << EOF
+[Service]
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# 限制 Capabilities，即便以 root 运行也只能执行必要操作
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+EOF
     
     if systemctl is-active --quiet xray; then
         info "✅ Xray Core 已成功安装并运行。"
@@ -43,7 +54,7 @@ uninstall_xray() {
     cleanup_xray_geodata
     
     # 暴力扫荡所有可能残留的二进制与配置目录，确保环境原子化还原
-    rm -rf /usr/bin/xray /usr/local/bin/xray /usr/local/etc/xray /etc/xray /opt/xray
+    rm -rf /usr/bin/xray /usr/local/bin/xray /usr/local/etc/xray /etc/xray /opt/xray /etc/systemd/system/xray.service.d
     
     info "✅ Xray 已彻底从系统中移除。"
 }

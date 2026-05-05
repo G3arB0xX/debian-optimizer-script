@@ -173,9 +173,9 @@ lockdown_ssh_system() {
 
     # 修改 sshd_config
     local config="/etc/ssh/sshd_config"
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$config"
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$config"
-    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$config"
+    set_conf_value "$config" "PermitRootLogin" "no" " "
+    set_conf_value "$config" "PasswordAuthentication" "no" " "
+    set_conf_value "$config" "PubkeyAuthentication" "yes" " "
     
     # 针对 Debian 12 的额外加固：确保 ssh.service 也重启以应用配置
     systemctl restart ssh
@@ -244,8 +244,7 @@ setup_security() {
     fi
 
     # 2. 安装并启用基础套件
-    apt-get update -yq >/dev/null 2>&1
-    apt-get install -yq nftables fail2ban >/dev/null 2>&1
+    safe_apt_install nftables fail2ban || return 1
 
     # 3. 构建规范化 /etc/nftables.conf
     # 采用标准 hook 架构，优先处理 established 连接以最大化性能

@@ -78,8 +78,11 @@ install_caddy() {
     
     # 初始化标准运行用户与目录
     if [[ ! -d "/etc/caddy" ]]; then
+        create_system_user "caddy"
+        # 补齐 caddy 组 (部分系统 useradd 不会自动创建同名组)
         groupadd --system caddy 2>/dev/null || true
-        useradd --system --gid caddy --create-home --home-dir /var/lib/caddy --shell /usr/sbin/nologin caddy 2>/dev/null || true
+        usermod -aG caddy caddy
+        
         mkdir -p /etc/caddy /etc/ssl/caddy /usr/share/caddy
         chown -R caddy:root /etc/caddy /etc/ssl/caddy
         echo "<h1>Caddy Standard Landing Page</h1>" > /usr/share/caddy/index.html
@@ -87,7 +90,7 @@ install_caddy() {
     fi
 
     # 部署官方推荐的 Systemd 单元
-    cat > /etc/systemd/system/caddy.service << EOF
+    deploy_systemd_service "caddy" << EOF
 [Unit]
 Description=Caddy Web Server
 After=network.target network-online.target
@@ -102,12 +105,20 @@ ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
 Restart=on-failure
 LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Security Sandboxing ---
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# 允许 Caddy 写入其证书存储目录
+ReadWritePaths=/var/lib/caddy /etc/ssl/caddy
+# ---------------------------
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now caddy
     
     # 防火墙自动化下发 (nftables)
     add_fw_rule "80,443" "tcp/udp" "Caddy_Web"
@@ -124,6 +135,7 @@ uninstall_caddy() {
     rm -rf /etc/caddy /usr/share/caddy /etc/ssl/caddy
     
     [[ -f "/etc/nftables/debopti.d/Caddy_Web.nft" ]] && rm -f "/etc/nftables/debopti.d/Caddy_Web.nft" && nft -f /etc/nftables.conf
+    id -u caddy >/dev/null 2>&1 && userdel caddy
     info "✅ Caddy 已移除。"
 }
 
@@ -161,21 +173,34 @@ install_derper() {
     local ip=$(curl -s4 --connect-timeout 3 ifconfig.me || echo "127.0.0.1")
     openssl req -x509 -newkey ed25519 -days 3650 -nodes -keyout "${cert_dir}/${ip}.key" -out "${cert_dir}/${ip}.crt" -subj "/CN=${ip}" >/dev/null 2>&1
     
-    cat > /etc/systemd/system/derper.service << EOF
+    # 初始化标准运行用户
+    create_system_user "derper"
+    chown -R derper:derper /opt/derper
+
+    deploy_systemd_service "derper" << EOF
 [Unit]
 Description=Tailscale DERP Relay Server (Stealth)
 After=network.target
 
 [Service]
 Type=simple
+User=derper
+Group=derper
 ExecStart=/usr/bin/derper -a :34781 -hostname ${ip} -certmode manual -certdir ${cert_dir} -stun -http-port -1 -verify-clients=false
 Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Security Sandboxing ---
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# ---------------------------
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now derper
     
     # 防火墙自动化 (nftables)
     add_fw_rule "34781" "tcp" "DERP_Relay"
@@ -191,6 +216,7 @@ uninstall_derper() {
     systemctl disable derper >/dev/null 2>&1
     rm -f /etc/systemd/system/derper.service /usr/bin/derper
     rm -rf /opt/derper
+    id -u derper >/dev/null 2>&1 && userdel derper
     
     [[ -f "/etc/nftables/debopti.d/DERP_Relay.nft" ]] && rm -f "/etc/nftables/debopti.d/DERP_Relay.nft"
     [[ -f "/etc/nftables/debopti.d/DERP_STUN.nft" ]] && rm -f "/etc/nftables/debopti.d/DERP_STUN.nft"
